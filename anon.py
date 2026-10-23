@@ -1,0 +1,3594 @@
+#!/usr/bin/env python3
+"""anon.py — deterministic, local anonymizer for text documents.
+
+The anonymizer CANNOT be an LLM: to anonymize, a model would first have to receive the
+data. So detection is 100% deterministic (regex + a curated dictionary) and 100% local
+(Python stdlib only, no network, no telemetry).
+
+  input file  ->  <name>.redacted.<ext>  (+ a reversible map in ~/.anon/maps/)
+
+Every sensitive span is replaced by a typed placeholder (`[EMAIL-1]`, `[CLIENTE-2]`, ...)
+and recorded in a JSON map. `deanon.py` re-applies the real values to the finished
+document, so "source document -> redacted copy -> final report" loses nothing.
+
+Modes
+  anon.py FILE [--out PATH] [--map PATH] [--entities PATH ...] [--stdout] [--quiet]
+  anon.py FILE --check [--json]      # no output written; report only (used by anon-guard)
+  anon.py --prune-maps DAYS [--yes]  # list (or delete) the maps older than DAYS
+
+Exit codes
+  0  ok (or --check: nothing sensitive found, or --audit: clean)
+  1  --check: sensitive content found
+  2  error (bad arguments, unreadable file, unparseable entities)
+  4  --audit: nothing directly sensitive, but near-miss candidates (not clean, not proof)
+
+Design notes
+  * Idempotent: already-present placeholders are protected, so anonymizing twice is a no-op
+    and never corrupts the document.
+  * Lossless: the map stores the exact matched substring, so anon -> deanon reproduces the
+    original byte for byte.
+  * The map (which holds the REAL values) is written only under ~/.anon/maps/ (mode 0600),
+    never next to the document, never inside a working directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import array
+import fnmatch
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+import zipfile
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+from xml.sax.saxutils import escape as _sax_escape
+from typing import Callable, Iterable
+
+VERSION = "2.2.1"
+SCHEMA = "anon/1"  # stable machine contract for every --json output of the suite
+
+ANON_HOME = Path(os.environ.get("ANON_HOME") or (Path.home() / ".anon"))
+DEFAULT_ENTITIES = ANON_HOME / "entities.txt"
+# The dictionary is split by kind so each file stays small and precise. All six are optional, and
+# each may open with `@type X` and then list bare values. `entities.txt` stays the generic one.
+DEFAULT_PEOPLE = ANON_HOME / "people.txt"  # `@type PERSONA`
+DEFAULT_CLIENTS = ANON_HOME / "clients.txt"  # `@type AZIENDA` — companies
+DEFAULT_PHONE_NUMBERS = ANON_HOME / "phone_numbers.txt"  # `@type TELEFONO`
+DEFAULT_EMAILS = ANON_HOME / "emails.txt"  # `@type EMAIL`
+DEFAULT_ADDRESSES = ANON_HOME / "addresses.txt"  # `@type INDIRIZZO`
+DEFAULT_DICTIONARIES = (
+    DEFAULT_ENTITIES, DEFAULT_PEOPLE, DEFAULT_CLIENTS,
+    DEFAULT_PHONE_NUMBERS, DEFAULT_EMAILS, DEFAULT_ADDRESSES,
+)
+# Named access for the front-ends (the web UI's Dizionario tab, the query parameter `file`).
+DICTIONARIES = {
+    "entities": DEFAULT_ENTITIES,
+    "people": DEFAULT_PEOPLE,
+    "clients": DEFAULT_CLIENTS,  # legacy name for the companies file
+    "phone_numbers": DEFAULT_PHONE_NUMBERS,
+    "emails": DEFAULT_EMAILS,
+    "addresses": DEFAULT_ADDRESSES,
+}
+DEFAULT_MAPS = ANON_HOME / "maps"
+DEFAULT_ALLOW = ANON_HOME / "allow.txt"
+CATALOGS_DIR = ANON_HOME / "catalogs"
+
+# The code a build SHIPS: the fingerprint below covers exactly these paths, so the same algorithm on
+# the host (the repository) and inside the container (/app) answers one question — is the running
+# build the current code? `convert.py` is optional: it follows the image variant (`with_convert`),
+# so the full image (which has it) and the slim one (which does not) are each compared against their
+# own file set. `catalogs/` is data (`ANON_HOME/catalogs`, mounted over), not shipped code.
+CODE_FINGERPRINT_FILES = (
+    "anon.py",
+    "deanon.py",
+    "composition.py",
+    "suggest.py",
+    "pdfout.py",
+    "docker-entrypoint.sh",
+    "requirements-anydoc.txt",
+)
+CODE_FINGERPRINT_DIRS = ("web",)
+# The `.dockerignore` entries that can appear under the shipped dirs, listed here rather than parsed:
+# a file the build never copies must not move the digest, or a macOS `.DS_Store` landing in `web/`
+# would report a container stale that no rebuild can fix. A NEW ignore pattern in `.dockerignore`
+# that could match a file under `CODE_FINGERPRINT_DIRS` has to be added here too. The data suffixes
+# (`.map.json`, `.redacted.*`, `.deanon.*`) are deliberately NOT mapped: they cannot occur under
+# `web/`, and mapping patterns that cannot match would be noise.
+CODE_FINGERPRINT_IGNORED_DIRS = ("__pycache__", ".git", ".venv", "venv")
+CODE_FINGERPRINT_IGNORED_NAMES = (".DS_Store", ".env", ".gitignore")
+CODE_FINGERPRINT_IGNORED_SUFFIXES = (".pyc", ".md")
+
+
+def code_fingerprint(root: Path | None = None, *, with_convert: bool | None = None) -> str:
+    """A stable digest of the shipped code (engine + front-end), for the running-container check.
+
+    Deterministic on purpose: sorted relative paths, length-prefixed raw bytes, no mtime and no
+    environment, so two checkouts of the same code hash the same and a single edited byte changes
+    the digest. `with_convert=None` follows the tree (the file is included only if it is present);
+    a caller that knows the image variant states it, so the full build and the slim build are each
+    compared against their own file set. The web server reports the digest in `/api/state`;
+    `scripts/check-container-fresh.py` compares it with the repository's, which is how a container
+    that was never rebuilt after a fix is caught.
+    """
+    base = Path(root) if root is not None else Path(__file__).resolve().parent
+    names = list(CODE_FINGERPRINT_FILES)
+    if with_convert is None:
+        with_convert = (base / "convert.py").is_file()
+    if with_convert:
+        names.append("convert.py")
+
+    paths: list[Path] = []
+    for name in names:
+        candidate = base / name
+        if candidate.is_file():
+            paths.append(candidate)
+    for name in CODE_FINGERPRINT_DIRS:
+        directory = base / name
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix in CODE_FINGERPRINT_IGNORED_SUFFIXES:
+                continue
+            if path.name in CODE_FINGERPRINT_IGNORED_NAMES:
+                continue
+            # RELATIVE parts: `path.parts` spans the absolute path, so a checkout living under a
+            # directory named `venv` would filter out every file and the digest would stop moving.
+            if any(part in CODE_FINGERPRINT_IGNORED_DIRS for part in path.relative_to(base).parts):
+                continue
+            paths.append(path)
+
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: item.relative_to(base).as_posix()):
+        content = path.read_bytes()
+        digest.update(path.relative_to(base).as_posix().encode("utf-8"))
+        digest.update(b"\x00")
+        # Length-prefixed: without it the boundary between one file's bytes and the next file's name
+        # is ambiguous, and two different file sets can collide.
+        digest.update(str(len(content)).encode("ascii"))
+        digest.update(b"\x00")
+        digest.update(content)
+    return digest.hexdigest()
+
+# `[EMAIL-1]` is the bare form; `[EMAIL-1-a3f9]` carries a per-map tag. The tag is what makes a
+# WRONG MAP detectable: placeholders are numbered per document, so without it a document from run
+# A silently accepts run B's map whenever the numbers happen to line up. Absent tag = a map made
+# before this existed (still supported).
+PLACEHOLDER_RE = re.compile(r"\[[A-Z][A-Z0-9_]*-\d+(?:-[0-9a-f]{4,8})?\]")
+
+# Values that are structurally sensitive-looking but are deliberately public: RFC 2606
+# reserved domains, RFC 5737 documentation networks, loopback/wildcard. Redacting them
+# would only hurt readability (and turn every `example.com` in a test into noise).
+SAFE_EXACT = {
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1",
+    "example.com",
+    "example.org",
+    "example.net",
+    "user@example.com",
+    "test@example.com",
+    "noreply@example.com",
+    "john.doe@example.com",
+}
+SAFE_DOMAIN_SUFFIXES = (".example", ".test", ".invalid", ".localhost")
+SAFE_NETS: tuple[ipaddress._BaseNetwork, ...] = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("0.0.0.0/32"),
+    ipaddress.ip_network("192.0.2.0/24"),
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
+    ipaddress.ip_network("::1/128"),
+    # Public resolvers / netmask: appear in every network config, never sensitive.
+    ipaddress.ip_network("8.8.8.8/32"),
+    ipaddress.ip_network("8.8.4.4/32"),
+    ipaddress.ip_network("1.1.1.1/32"),
+    ipaddress.ip_network("1.0.0.1/32"),
+    ipaddress.ip_network("9.9.9.9/32"),
+    ipaddress.ip_network("255.255.255.255/32"),
+)
+
+# File extensions that look like a two-label "FQDN" but are filenames. Without this,
+# `anon.py` (TLD .py == Paraguay) or `main.js` would be redacted and reads blocked.
+FILE_EXT = {
+    "py", "pyc", "pyi", "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "json5", "md",
+    "markdown", "txt", "text", "rst", "yaml", "yml", "toml", "ini", "cfg", "conf", "env",
+    "log", "csv", "tsv", "xml", "html", "htm", "css", "scss", "less", "sh", "bash", "zsh",
+    "fish", "ps1", "bat", "cmd", "c", "h", "cc", "cpp", "hpp", "cs", "java", "kt", "go",
+    "rs", "rb", "php", "pl", "lua", "swift", "scala", "sql", "db", "sqlite", "lock", "map",
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "pdf", "doc", "docx", "xls",
+    "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "epub", "zip", "tar", "gz", "tgz",
+    "bz2", "xz", "7z", "rar", "dmg", "exe", "msi", "deb", "rpm", "bin", "iso", "img",
+    "mp3", "mp4", "mov", "avi", "mkv", "wav", "flac", "ttf", "otf", "woff", "woff2",
+    "plist", "service", "patch", "diff", "bak", "tmp", "old", "orig", "example", "am",
+}
+
+# A dotted token is only a hostname when its LAST label looks like a real TLD. The earlier
+# rule ("3+ labels = host") redacted ordinary code — `os.environ.get`, `numpy.random.normal`,
+# `child.stdout.on` — which made the default-on guard unusable. Word-like ccTLDs that collide
+# with English/method names (`in`, `id`, `is`, `as`, `at`, `by`, `be`, `do`, `to`, `me`, `no`,
+# `so`) and generic gTLD words (`info`, `name`, `site`, `app`, `dev`, `cloud`, `home`, ...) are
+# deliberately absent: `logger.info`, `obj.id`, `arr.at` must not be treated as hosts.
+ORG_TLDS = {
+    "com", "org", "net", "edu", "gov", "mil", "int", "eu",
+    "it", "ch", "fr", "de", "es", "pt", "nl", "uk", "ie", "dk", "se", "fi", "pl", "cz", "sk",
+    "hu", "ro", "gr", "hr", "si", "rs", "bg", "lt", "lv", "ee", "mt", "cy", "lu", "us", "ca",
+    "mx", "br", "ar", "cl", "au", "nz", "jp", "cn", "kr", "sg", "za", "tr", "ru", "ua", "il",
+    "ae", "sa", "eg", "al", "ba", "mk", "ge", "am", "az", "kz", "md",
+    "local", "lan", "internal", "intranet", "corp", "azienda",
+}
+
+
+def _is_safe(value: str) -> bool:
+    """True for known-public values that must NOT be redacted."""
+    v = value.strip().lower()
+    if not v:
+        return True
+    if v in SAFE_EXACT:
+        return True
+    if any(v.endswith(suffix) for suffix in SAFE_DOMAIN_SUFFIXES):
+        return True
+    if "://" in v or v.startswith("www."):
+        host = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", v).split("/")[0]
+        host = host.rsplit("@", 1)[-1].split(":")[0]
+        return _is_safe(host[4:] if host.startswith("www.") else host)
+    if "@" in v:
+        return _is_safe(v.rsplit("@", 1)[1])
+    try:
+        addr = ipaddress.ip_address(v)
+    except ValueError:
+        return False
+    return any(addr in net for net in SAFE_NETS)
+
+
+def _valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _valid_host(value: str) -> bool:
+    labels = value.split(".")
+    if len(labels) < 2:
+        return False
+    tld = labels[-1].lower()
+    return tld in ORG_TLDS and tld not in FILE_EXT
+
+
+def _valid_phone(value: str) -> bool:
+    digits = re.sub(r"\D", "", value)
+    return 9 <= len(digits) <= 15
+
+
+# Values that are obviously written-in-place, not secrets: redacting them would block reading
+# every README and example config. The match is on the WHOLE value. A substring test could let
+# `password: synthetic-password-value` slip through; a false positive is safer
+# than leaving a real secret unredacted.
+_PLACEHOLDER_VALUES = frozenset(
+    {
+        "changeme", "change-me", "change_me", "changed", "placeholder", "redacted", "dummy",
+        "example", "sample", "fake", "none", "null", "nil", "todo", "secret", "password",
+        "your", "your-password", "your-secret", "your-token", "your-key", "your-api-key",
+        "your-api-key-here", "your-key-here", "your-token-here", "your-secret-here",
+        "see-above", "see-below", "see-above-", "n-a", "na", "unknown", "not-set", "notset",
+        "xxx", "xxxx", "xxxxx", "xxxxx xxxxx", "test", "testing", "local", "dev",
+    }
+)
+
+
+# Anchored (not substring) prefix test: `placeholder-value` and `your-token` are placeholders,
+# while `synthetic-password-sentinel` is a secret-shaped test value.
+_PLACEHOLDER_PREFIX = re.compile(
+    r"^(?:your|placeholder|example|sample|dummy|fake|changeme|change|secret|password|token|"
+    r"key|xxx|todo|none|null|not|see)(?:[-_.]|$)"
+)
+
+
+# --- Italian/IBAN identifiers: FORMAT + CHECKSUM. A validated identifier has almost no false
+# positives, which is the opposite of a word list — this is where a privacy tool gets its
+# precision. Algorithms: DPR 633/1972 (partita IVA), the standard CF check-character tables,
+# ISO 13616 mod-97 (IBAN).
+_OMOCodia = str.maketrans({"L": "0", "M": "1", "N": "2", "P": "3", "Q": "4",
+                          "R": "5", "S": "6", "T": "7", "U": "8", "V": "9"})
+_CF_ODD = {
+    "0": 1, "1": 0, "2": 5, "3": 7, "4": 9, "5": 13, "6": 15, "7": 17, "8": 19, "9": 21,
+    "A": 1, "B": 0, "C": 5, "D": 7, "E": 9, "F": 13, "G": 15, "H": 17, "I": 19, "J": 21,
+    "K": 2, "L": 4, "M": 18, "N": 20, "O": 11, "P": 3, "Q": 6, "R": 8, "S": 12, "T": 14,
+    "U": 16, "V": 10, "W": 22, "X": 25, "Y": 24, "Z": 23,
+}
+# Even positions: a digit is its own value, a letter is its 0-based alphabet index (A=0..Z=25).
+_CF_EVEN = {
+    **{str(digit): digit for digit in range(10)},
+    **{char: index for index, char in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")},
+}
+_CF_FORMAT = re.compile(
+    r"[A-Z]{6}[0-9LMNPQRSTUV]{2}[ABCDEHLMPRST][0-9LMNPQRSTUV]{2}[A-Z][0-9LMNPQRSTUV]{3}[A-Z]"
+)
+
+
+def _valid_codice_fiscale(value: str) -> bool:
+    """16 chars whose 16th is the check character computed from the first 15."""
+    candidate = value.strip().upper()
+    if not _CF_FORMAT.fullmatch(candidate):
+        return False
+    # Omocodia: a numeric field may be written with letters (0->L, 1->M, ...). Decode first.
+    body = candidate[:15]
+    digits = [body[6], body[7], body[9], body[10], body[12], body[13], body[14]]
+    decoded = "".join(digits).translate(_OMOCodia)
+    if not decoded.isdigit():
+        return False
+    body = body[:6] + decoded[0:2] + body[8] + decoded[2:4] + body[11] + decoded[4:7]
+    total = 0
+    for index, char in enumerate(body, start=1):
+        total += _CF_ODD[char] if index % 2 else _CF_EVEN[char]
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[total % 26] == candidate[15]
+
+
+def _valid_partita_iva(value: str) -> bool:
+    """11 digits; the 11th is (10 - total mod 10) mod 10, doubling the EVEN positions."""
+    candidate = re.sub(r"\D", "", value)
+    if len(candidate) != 11:
+        return False
+    total = 0
+    for index, char in enumerate(candidate[:10], start=1):
+        digit = int(char)
+        if index % 2 == 0:
+            doubled = digit * 2
+            total += doubled // 10 + doubled % 10
+        else:
+            total += digit
+    return (10 - total % 10) % 10 == int(candidate[10])
+
+
+_IBAN_FORMAT = re.compile(r"[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}")
+
+
+def _valid_iban(value: str) -> bool:
+    """ISO 13616: move the first 4 chars to the end, letters -> 10..35, mod 97 must be 1."""
+    candidate = re.sub(r"[\s\-]", "", value).upper()
+    if not _IBAN_FORMAT.fullmatch(candidate):
+        return False
+    rearranged = candidate[4:] + candidate[:4]
+    numeric = "".join(str(int(char, 36)) for char in rearranged)
+    return int(numeric) % 97 == 1
+
+
+def _valid_targa(value: str) -> bool:
+    """Current Italian plate format (AA123BB). No checksum exists, so the format is the rule."""
+    return bool(re.fullmatch(r"[A-Z]{2}\d{3}[A-Z]{2}", value.strip().upper()))
+
+
+def _valid_secret(value: str) -> bool:
+    """False for values that are placeholders (`your-api-key-here`, `changeme`)."""
+    lowered = value.casefold().strip()
+    if lowered in _PLACEHOLDER_VALUES:
+        return False
+    if _PLACEHOLDER_PREFIX.match(lowered):
+        return False
+    if lowered.startswith(("<", "${", "{{", "%(", "[", "@")):
+        return False  # templated / variable reference, not a literal secret
+    if set(lowered) <= set("*._- "):
+        return False  # `****`, `....`, `----`
+    return True
+
+
+@dataclass(frozen=True)
+class Rule:
+    type: str
+    regex: re.Pattern[str]
+    capture: int = 0
+    validator: Callable[[str], bool] | None = None
+    trim_trailing: str = ""
+    # Pattern family, so a caller can enable/disable a whole class (`identity`, `network`,
+    # `legal`). Ticked on demand in the UI, `--patterns` on the command line.
+    family: str = "identity"
+    # When the validator rejects a match, retry with trailing labels removed. A hostname
+    # followed by a file extension (`db01.azienda.local.log`) must still yield the host.
+    shrink_labels: bool = False
+    # When the validator rejects a match, retry with trailing WHITESPACE-SEPARATED tokens removed.
+    # An IBAN is written with irregular spacing, so a loose body (`[A-Z0-9]\s?` repeated) is what
+    # matches every grouping — but it can also run into the token that FOLLOWS the code. The
+    # checksum decides where the value really ends: `IT60 … 456 entro` keeps `IT60 … 456`.
+    shrink_words: bool = False
+
+
+# Ordered by confidence: a URL/email/JWT/key span is claimed before any heuristic can
+# carve a substring out of it. Dictionary entities (curated, real) come next; IP/phone/host
+# heuristics last.
+
+
+# Street words that introduce an address. The abbreviations (`v.le`, `p.zza`) are how Italian
+# documents write them, and matching them is what keeps `V.le Europa, 12` one span instead of a
+# half-redacted "V.le" plus a visible name.
+ADDRESS_MARKERS = (
+    r"(?:via|viale|v\.?le|piazza|piazzale|p\.?zza|p\.?za|corso|strada|vicolo|largo|lungomare|"
+    r"traversa|borgo|stradone|salita)"
+)
+ADDRESS_SRC = (
+    r"(?<![\w])" + ADDRESS_MARKERS + r"\s+"
+    # Street name: 1..5 tokens, with dots and hyphens allowed inside (`G.`, `Via-Esempio`).
+    r"(?P<strada>[^\W\d_][\w'\u2019.\-]*(?:\s+[\w'\u2019.\-]+){0,4}?)"
+    r"[,\s]+(?:n\.?\s*)?"
+    # Civic number, required, with the Italian suffix (`3/A`, `12-bis`).
+    r"(?P<civico>\d{1,4})(?:\s*[/\-]\s*[A-Za-z0-9]{1,3})?(?![\w])"
+)
+ADDRESS_RE = re.compile(ADDRESS_SRC, re.IGNORECASE)
+
+# Elidable Italian function words, WITHOUT their apostrophe: when a truncation-apostrophe token
+# reduces to one of these (`Un'`, `Dell'`, `All'`), what followed was elided, not truncated — an
+# article left with nothing after it, not a street name. A list is needed because the two shapes are
+# otherwise identical; bounded on purpose (articles, prepositions, the common contractions).
+ELIDED_ARTICLES = frozenset({
+    "un", "uno", "una", "il", "lo", "la", "l", "gli", "le", "i",
+    "del", "dello", "della", "dei", "degli", "delle",
+    "al", "allo", "alla", "ai", "agli", "alle",
+    "dal", "dallo", "dalla", "dai", "dagli", "dalle",
+    "nel", "nello", "nella", "nei", "negli", "nelle",
+    "sul", "sullo", "sulla", "sui", "sugli", "sulle",
+    "col", "coi", "coll", "quest", "quell", "bell", "grand", "sant", "tutt", "mezz",
+    # `d'`/`c'` are elisions too (`d'accordo`, `c'è`). `po` is deliberately NOT here: `Via Po` is a
+    # real street, and `Po'` is a truncated name, not an article — the two are indistinguishable.
+    "d", "c",
+})
+
+
+def _address_street(value: str) -> str | None:
+    """The street-name part of a matched address, with its ORIGINAL capitalization.
+
+    `re.IGNORECASE` decides whether a string matches; the captured group still carries the
+    characters as written, which is exactly what `_valid_address` has to read.
+    """
+    shape = ADDRESS_RE.fullmatch(value.strip())
+    return shape.group("strada") if shape else None
+
+
+def _valid_address(value: str) -> bool:
+    """A marker word plus a civic number is not an address on its own.
+
+    `in via del tutto eccezionale, 3 volte` has the shape and none of the content, and it was the
+    false positive that made this rule untrustworthy. Requiring one capitalized name token drops
+    that whole class while keeping every form in the tests' address corpus (`Via G. Verdi 3/A`,
+    `Piazza G. Verdi, 3`, `Via Roma, n. 3`, `V.le Europa 12`, `VIA ROMA 12`).
+
+    Declared trade-off: an all-lowercase address (`via roma 12`) is NOT redacted - precision over
+    recall, the same choice the hostname heuristic makes, and the reason the guard stays usable.
+    """
+    street = _address_street(value)
+    if street is None:
+        return False
+    # `d'Azeglio`, `dell'Università`, `l'Aquila`: the elided article is lowercase and the name is
+    # not, so the capitalization test looks at the part AFTER the apostrophe. Testing every piece
+    # instead would make the ARTICLE the signal, and a capitalized contraction followed by ordinary
+    # prose (`via Un'ora di lavoro, 3`, `via All'incirca, 3`) is a sentence that reaches this rule
+    # with the shape of an address.
+    tokens = street.split()
+    for index, token in enumerate(tokens):
+        head = token.rsplit("'", 1)[-1].rsplit("\u2019", 1)[-1]
+        if head[:1].isupper():
+            return True
+        # An accent written as a TRUNCATION APOSTROPHE (`Liberta'`, `Universita'`) leaves that part
+        # empty, and it is the most common spelling in a plain-text note. The two shapes are
+        # mechanically distinguishable: a MEDIAL apostrophe elides an article (the name is what
+        # follows), a TRAILING one truncates the name itself — so a token that ends with an
+        # apostrophe is read before it too. Only the LAST token, because the article of a name
+        # whose space is misplaced (`via L' anno scorso, 3`) also ends with an apostrophe.
+        #
+        # An article left with nothing after it (`via Un' 3`) reduces to `Un`, which is why the
+        # reduced form is checked against ELIDED_ARTICLES: a capital letter is necessary but not
+        # sufficient, and this residue is now closed instead of declared.
+        if index == len(tokens) - 1 and token.endswith(("'", "\u2019")):
+            truncated = token.rstrip("'\u2019").rsplit("'", 1)[-1].rsplit("\u2019", 1)[-1]
+            if truncated[:1].isupper() and truncated.casefold() not in ELIDED_ARTICLES:
+                return True
+    return False
+
+
+RULES: tuple[Rule, ...] = (
+    Rule(
+        "URL",
+        re.compile(r"(?:(?:https?|ftp|sftp)://|www\.)[^\s<>\"'()\[\]{}]+", re.IGNORECASE),
+        trim_trailing=".,;:!?)]}\u00bb\"'",
+    ),
+    # Local part and labels are BOUNDED (RFC 5321/1035): an unbounded `+` here made the
+    # regex quadratic on a long run of word chars with a single '@' (minified JS, base64
+    # blobs): 8k chars took 1.7s, 400k would have taken minutes — and the guard's timeout
+    # turns that into a silent fail-open. Bounded quantifiers keep it linear.
+    Rule(
+        "EMAIL",
+        re.compile(
+            r"[A-Za-z0-9._%+\-]{1,64}@"
+            r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?"
+            r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?){1,10}"
+        ),
+    ),
+    Rule("KEY", re.compile(r"\beyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\b")),
+    Rule("KEY", re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b")),
+    Rule("KEY", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    Rule("KEY", re.compile(r"\bghp_[A-Za-z0-9]{20,}\b")),
+    Rule("KEY", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
+    Rule("KEY", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b")),
+    Rule(
+        "KEY",
+        re.compile(r"(?i:bearer)\s+([A-Za-z0-9._\-]{20,})", re.IGNORECASE),
+        capture=1,
+        validator=_valid_secret,
+    ),
+    Rule(
+        "KEY",
+        re.compile(
+            # An optional `prefix_` is allowed so `db_password:` / `db_secret:` match; the
+            # lookbehind (instead of \b) is what lets an underscore-prefixed name through.
+            r"(?i:(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-])?(?:api[_-]?key|apikey|secret|"
+            r"client[_-]?secret|password|passwd|pwd|token|access[_-]?token|refresh[_-]?token)"
+            r"\b\s*[:=]\s*[\"']?)"
+            # Reject a right-hand side that is a CALL (`token = re.compile(...)`): the `(` comes
+            # immediately after the value, which a literal secret does not do. The first lookahead
+            # keeps the token whole, so backtracking cannot truncate it to make the call check pass.
+            # Deliberately NOT rejected: a dotted value (`variant.first_token`, `synthetic_admin.secret`) — it
+            # can be a real password, and a missed secret is worse than a false positive (the fail-closed default).
+            r"([A-Za-z0-9._\-+/=]{8,})(?![A-Za-z0-9._\-+/=])(?!\()"
+        ),
+        capture=1,
+        validator=_valid_secret,
+    ),
+    # --- legal/administrative identifiers (validated, so precision is high) ----------------
+    Rule(
+        "CODICEFISCALE",
+        re.compile(r"(?<![\w])[A-Z]{6}[0-9LMNPQRSTUV]{2}[ABCDEHLMPRST][0-9LMNPQRSTUV]{2}[A-Z][0-9LMNPQRSTUV]{3}[A-Z](?![\w])", re.IGNORECASE),
+        validator=_valid_codice_fiscale,
+        family="legal",
+    ),
+    Rule(
+        "PARTITAIVA",
+        # `(?:IT)?` — writing `IT?` would mean "an I followed by an optional T".
+        re.compile(r"(?<![\d.])(?:IT)?\s?(\d{11})(?!\d)", re.IGNORECASE),
+        capture=1,
+        validator=_valid_partita_iva,
+        family="legal",
+    ),
+    Rule(
+        "IBAN",
+        # A loose body — any alnum with an optional single space — because the REAL groupings vary
+        # (`IT60X0542811101000000123456`, `IT60 X054 2811 … 456`, `IT60 X 05428 11101 000000123456`).
+        # That is also why it can over-run into the following token under IGNORECASE: `shrink_words`
+        # below drops trailing tokens until the checksum accepts the longest valid prefix, which
+        # turns `IT60 … 456 entro` back into `IT60 … 456` instead of rejecting the whole match.
+        re.compile(r"(?<![\w])IT\s?\d{2}\s?[A-Z]\s?(?:[A-Z0-9]\s?){10,30}(?![\w])", re.IGNORECASE),
+        validator=_valid_iban,
+        family="legal",
+        shrink_words=True,
+    ),
+    Rule(
+        "TARGA",
+        re.compile(r"(?<![\w])[A-Z]{2}\s?\d{3}\s?[A-Z]{2}(?![\w])"),
+        validator=_valid_targa,
+        family="legal",
+    ),
+    Rule(
+        # An address identifies a person as surely as a name does. The marker word is required,
+        # and at least one name token plus a civic number: `via Roma 12`, `Piazza G. Verdi, 3`.
+        "INDIRIZZO",
+        ADDRESS_RE,
+        validator=_valid_address,
+        family="legal",
+    ),
+)
+
+HEURISTIC_RULES: tuple[Rule, ...] = (
+    # The trailing guard rejects a longer dotted run (`.40.5`, `.beta`) but not the full stop that
+    # closes a sentence: `(?![\w.])` kept `il gateway e' 10.20.30.40.` unredacted, which is how an
+    # address is written in every report. `(?!\.\w)` is the guard the HOST rule below carries (its
+    # own `(?!\w\-)` also refuses a trailing hyphen, which an address cannot have): it accepts
+    # punctuation (`10.20.30.40.`, `10.20.30.40...`, `(10.20.30.40.)`) and still refuses a dotted run
+    # whose continuation is a label. Trade-off declared: a four-part NUMBER at the end of a sentence (`aggiornato alla 3.4.5.6.`) is redacted as an address — the two are the same shape,
+    # and for an anonymizer a false positive costs a placeholder where a false negative leaks.
+    Rule(
+        "IP",
+        re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w)(?!\.\w)"),
+        validator=_valid_ip,
+        family="network",
+    ),
+    Rule(
+        "IP",
+        re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:])"),
+        validator=_valid_ip,
+        family="network",
+    ),
+    Rule(
+        "TEL",
+        re.compile(
+            # +CC international (covers +39 Italy too), 0039 and bare Italian mobiles
+            r"(?<![\w.])(?:\+\d{1,3}[\s.\-/]?\d{2,4}[\s.\-/]?\d{3,4}[\s.\-/]?\d{2,4}"
+            r"|0039[\s.\-/]?\d{5,12}"
+            r"|3\d{2}[\s.\-/]?\d{3,4}[\s.\-/]?\d{3})(?![\w])"
+        ),
+        validator=_valid_phone,
+        family="network",
+    ),
+    Rule(
+        "HOST",
+        re.compile(
+            r"(?<![\w.\-])(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+"
+            r"[A-Za-z]{2,63}(?![\w\-])(?!\.\w)"  # allow a trailing sentence period
+        ),
+        validator=_valid_host,
+        shrink_labels=True,
+        family="network",
+    ),
+)
+
+PATTERN_FAMILIES = ("identity", "network", "legal")
+
+# Tie-break priorities, used only when two candidates cover the SAME span: the strong patterns
+# win, then the curated dictionary (operator intent), then the heuristics.
+ENTITY_PRIORITY = 500
+HEURISTIC_PRIORITY = 1000
+
+
+# Legal forms are stripped from the dictionary value and tolerated as an optional suffix, so a
+# single entry matches the whole family: `Contoso` covers `Contoso S.r.l.`, `contoso srl`, `CONTOSO`.
+# Whole-token match, bounded quantifiers only (no nested `*` on `\s`: no ReDoS surface).
+LEGAL_FORM_SRC = (
+    r"(?:s\.?\s?r\.?\s?l\.?\s?s?"  # srl / s.r.l. / srls
+    r"|s\.?\s?p\.?\s?a\.?"  # spa
+    r"|s\.?\s?n\.?\s?c\.?"  # snc
+    r"|s\.?\s?a\.?\s?s\.?"  # sas
+    r"|s\.?\s?a\.?"  # sa
+    r"|s\.?\s?s\.?"  # ss
+    r"|ltd|llc|inc|gmbh|ag|bv|nv|sarl|sàrl|sl|oy|ab|aps|pte|pty|corp|kg|ug|sro|doo|ooo|plc|llp"
+    r"|ltda|eirl|slu|sagl|sr[l]?"
+    r"|&\s?c\.?|e\s?c\.)"
+)
+LEGAL_FORM_RE = re.compile(LEGAL_FORM_SRC, re.IGNORECASE)
+LEGAL_SUFFIX_RE = r"(?:\s+" + LEGAL_FORM_SRC + r"(?![a-z0-9]))?"
+
+# Separators allowed between the words of a name: `Acme-Italia` = `Acme.Italia` = `Acme Italia`.
+# ONE or more, on purpose: in a TEXT, `AcmeItalia` is a different word, and a value `Acme Italia`
+# must not claim it. The run-fragment a reader cannot see is a CONTAINER matter, handled by the
+# two views of a part (`_views_of`) — not by loosening the matcher for every text.
+NAME_SEPARATOR_RE = r"[\s.\-_'’,]+"
+
+
+ENTITY_GROUP = "entity"
+
+
+@dataclass(frozen=True)
+class Entity:
+    """A dictionary entry: what to look for, what it is, and how it matches."""
+
+    type: str
+    surface: str
+    regex: re.Pattern[str]
+    # Fast-scan metadata filled by `_entity_regexes` (see `entity_hits`). An entry built by hand
+    # has none, and is then scanned directly instead of being skipped.
+    first_token: str = ""
+    inner: str = ""
+    context: str | None = None
+    form: str = "NFC"
+    # Provenance, for the reports only — the matcher never reads these.
+    line: int = 0  # the dictionary line the entry was declared on
+    case_sensitive: bool = False  # how the entry matches, already compiled into `regex`
+
+    def spans(self, text: str):
+        """Yield (start, end, matched_text) for every occurrence.
+
+        The reference implementation: one full-text pass per entry. Correct and slow — it is
+        what `entity_hits` has to reproduce, and what the equivalence test compares against.
+        """
+        for match in self.regex.finditer(text):
+            start, end = match.span(ENTITY_GROUP)
+            yield start, end, match.group(ENTITY_GROUP)
+
+
+@dataclass(frozen=True)
+class EntityVariant:
+    """One compiled form of a dictionary entry, plus what a fast scan needs to find it."""
+
+    regex: re.Pattern[str]
+    # The same pattern WITHOUT the `(?P<entity>…)` wrapper: several entries that share a
+    # `@context` are compiled into one alternation, which cannot repeat the group name.
+    inner: str
+    # The first name token, normalized like the pattern. Every match contains it verbatim, so a
+    # text that does not contain it can skip the pattern entirely (the whole point of the scan).
+    first_token: str
+    # `@context` entries are NOT literal-scannable: their match starts at the context, not at the
+    # first token. They are grouped by (context, normalization form) and scanned once per group.
+    context: str | None = None
+    form: str = "NFC"
+
+
+def _name_tokens(value: str) -> list[str]:
+    """The surface form split into tokens, with a trailing legal form dropped.
+
+    `len(tokens) > 1`: a company literally named "SA"/"AG"/"AB" must stay declarable. Stripping
+    its only token would produce zero regexes and silently drop the entry (a false negative).
+    """
+    tokens = [token for token in re.split(r"\s+", value.strip()) if token]
+    while len(tokens) > 1 and LEGAL_FORM_RE.fullmatch(tokens[-1]):
+        tokens.pop()
+    return tokens
+
+
+def _entity_regexes(
+    value: str,
+    *,
+    stem: bool = False,
+    case_sensitive: bool = False,
+    context: str | None = None,
+) -> list[EntityVariant]:
+    """One variant per Unicode normalization form, so a macOS NFD file matches an NFC dictionary."""
+    tokens = _name_tokens(value)
+    if not tokens:
+        return []
+    core = NAME_SEPARATOR_RE.join(re.escape(token) for token in tokens) + LEGAL_SUFFIX_RE
+    if stem:
+        # `Pincopallino` must also cover `Pincopallino1`, `Pincopallino-DB01`, `PINCOPALLINO_srv`.
+        # Opt-in per entry: on a common word a stem rule would over-redact.
+        core += r"[\w\-]*"
+    # Case sensitivity applies to the ENTITY only: a `@context` marker like "comune di" must
+    # still match however it is capitalized in the document, while `Prato` must not match `prato`.
+    inner = f"(?-i:{core})" if case_sensitive else core
+    prefix = f"(?:{context})(?<!\\w)" if context else r"(?<!\w)"
+    variants: list[EntityVariant] = []
+    seen: set[str] = set()
+    for form in ("NFC", "NFD"):
+        # The first token is normalized like the pattern: an NFC token compared against an NFD
+        # text (or the reverse) would make the fast scan miss a match the pattern would find.
+        normalized_inner = unicodedata.normalize(form, inner)
+        normalized_context = unicodedata.normalize(form, context) if context else None
+        normalized_prefix = f"(?:{normalized_context})(?<!\\w)" if context else prefix
+        # An entry followed by an apostrophe and a LETTER is an elided Italian article
+        # (`Dell'azienda` = "of the company", not the vendor Dell). The exception is the English
+        # genitive `'s`, which is not an elision: without it, `Dell's CTO` would leave `Dell` in
+        # clear — a false negative traded for a false positive. `(?![sS](?!\w))` = "not an s that
+        # ends the word", so `'azienda` is rejected while `'s` (and `'s.`) is matched.
+        full = f"{normalized_prefix}(?P<{ENTITY_GROUP}>{normalized_inner})(?!\\w)(?!['\u2019](?![sS](?!\\w))\\w)"
+        if full in seen:  # pure-ASCII entries normalize to the same pattern twice
+            continue
+        seen.add(full)
+        variants.append(
+            EntityVariant(
+                regex=re.compile(full, re.IGNORECASE),
+                inner=normalized_inner,
+                first_token=unicodedata.normalize(form, tokens[0]),
+                context=normalized_context,
+                form=form,
+            )
+        )
+    return variants
+
+
+# Directives apply to the entries that FOLLOW them, so one file can mix behaviours (a
+# case-sensitive, context-gated city catalog next to plain names).
+KNOWN_DIRECTIVES = ("type", "stem", "match", "context")
+_TRUE = ("", "on", "true", "yes", "1")
+_FALSE = ("off", "false", "no", "0")
+
+# A stem matches any suffix (`Acme` -> `AcmeCorp`, `Acme-DB01`), so a 3-4 character stem quietly
+# redacts unrelated words.
+STEM_MIN_CHARS = 5
+
+# Warned once per stem body per process: the web UI reloads the dictionary on every request, and
+# an operator must not get the same line of stderr on every click.
+_WARNED_STEMS: set[str] = set()
+
+# A value copied straight out of a document footer carries the sentence with it: `BeSafe S.r.l:`
+# declared with the colon matches ONLY the colon form, and the bare `BeSafe` two lines later stays
+# in clear — which on screen reads as "the dictionary was not reloaded" when it was. Trailing
+# sentence punctuation is never part of a name, so the parser drops it and says so. Two values
+# keep their trailing dot ON PURPOSE: a single character (`A.` is a real initial, not a typo) and
+# a bare legal form (`S.r.l.` declared AS the value must keep matching the literal, not every
+# `srl` in every text — stripping it would silently turn a literal into a family).
+TRAILING_PUNCT = ".,;:!?…"
+
+# The invisible characters of a document are not part of a name. Word writes a soft hyphen
+# (U+00AD) inside every hyphenated word it re-saves, zero-width characters glue scripts, bidi
+# controls order mixed scripts — and the operator SEES none of them: the value copied out of the
+# document is the clean one, the bytes inside it are not. Measured: a `BeSafe` carrying one soft
+# hyphen stayed in clear while the same occurrence elsewhere was redacted — which on screen
+# reads as "the dictionary was not reloaded" when it was, and the run reported success. Every
+# one of these is Unicode category Cf (format): a zero-width mark in the TEXT of a name, never a
+# letter. Combining accents are NOT here: they are real letters of a name and the NFC/NFD
+# variants already handle them.
+INVISIBLE_CHARS = (
+    "\u00ad"  # soft hyphen — the one Word writes inside hyphenated words
+    "\u034f"  # combining grapheme joiner — Mn, but never a glyph of a name
+    "\u061c\u180e"  # arabic letter mark, mongolian vowel separator
+    "\u200b\u200c\u200d"  # zero-width space, non-joiner, joiner
+    "\u200e\u200f"  # left-to-right / right-to-left marks
+    "\u202a\u202b\u202c\u202d\u202e"  # bidi embedding and override controls
+    "\u2060\u2061\u2062\u2063\u2064"  # word joiner, invisible math operators
+    "\u2066\u2067\u2068\u2069"  # bidi isolates
+    "\ufeff"  # zero-width no-break space (inline BOM)
+    + "".join(chr(_c) for _c in range(0xFE00, 0xFE10))  # variation selectors — Mn, no glyph
+    + "\ufff9\ufffa\ufffb"  # interlinear annotation
+    + "".join(chr(_c) for _c in range(0x1D173, 0x1D17B))  # musical format controls
+    + "\U000e0001"  # language tag character
+    + "".join(chr(_c) for _c in range(0xE0020, 0xE0080))  # tag characters: how text hides text
+)
+INVISIBLE_SET = frozenset(INVISIBLE_CHARS)
+INVISIBLE_RE = re.compile("[" + re.escape(INVISIBLE_CHARS) + "]")
+
+
+def invisible_free(text: str) -> tuple[str, "array.array | None"]:
+    """(the text the matcher sees, the offset in `text` of every kept character, or None).
+
+    The offset array exists only when something was stripped: a clean text pays one regex probe,
+    not an int per character. A span `[start:end]` of the cleaned text maps back to the source
+    as `offsets[start] .. offsets[end - 1] + 1` — `end > start` always holds for a real span.
+    """
+    if INVISIBLE_RE.search(text) is None:
+        return text, None
+    clean: list[str] = []
+    offsets = array.array("i")
+    for position, char in enumerate(text):
+        if char not in INVISIBLE_SET:
+            clean.append(char)
+            offsets.append(position)
+    return "".join(clean), offsets
+
+# Warned once per stripped value per process, same reason as _WARNED_STEMS.
+_WARNED_PUNCT: set[tuple[str, str]] = set()
+
+
+def _clean_surface(display: str, lineno: int, value: str) -> str:
+    """Drop what a copy-paste out of a document glues onto a name: the sentence after it, and
+    the invisible characters inside it. Warned once per value per process; never a refusal."""
+    if INVISIBLE_RE.search(value):
+        stripped = "".join(char for char in value if char not in INVISIBLE_SET)
+        if stripped and stripped != value:
+            if (display, value.casefold()) not in _WARNED_PUNCT:
+                _WARNED_PUNCT.add((display, value.casefold()))
+                print(
+                    f"anon: {display} line {lineno}: invisible characters stripped from a declared value — "
+                    "a value copied from a document carries what the eye cannot see",
+                    file=sys.stderr,
+                )
+            value = stripped
+    trimmed = value.rstrip(TRAILING_PUNCT)
+    if (
+        not trimmed
+        or trimmed == value
+        or len(trimmed) == 1
+        or LEGAL_FORM_RE.fullmatch(trimmed)
+    ):
+        return value
+    if (display, value.casefold()) not in _WARNED_PUNCT:
+        _WARNED_PUNCT.add((display, value.casefold()))
+        print(
+            f"anon: {display} line {lineno}: trailing punctuation stripped from a declared value — "
+            "a value copied from a document carries the sentence with it; declare the name",
+            file=sys.stderr,
+        )
+    return trimmed
+
+
+def _warn_short_stem(display: str, lineno: int, value: str) -> None:
+    """Warn — never refuse — when a `@stem` entry is short enough to over-redact.
+
+    Refusing would be a hard error on a live dictionary, and an engine that fails to load is an
+    engine downstream checks report as unavailable: it then turns itself OFF for the session. A
+    dictionary nit must not be able to fail open a privacy control.
+    """
+    body = "".join(_name_tokens(value))
+    if len(body) >= STEM_MIN_CHARS or body.casefold() in _WARNED_STEMS:
+        return
+    _WARNED_STEMS.add(body.casefold())
+    print(
+        f"anon: {display} line {lineno}: @stem on a declared value ({len(body)} characters) — a stem "
+        "this short also matches unrelated words; declare the full forms instead",
+        file=sys.stderr,
+    )
+
+
+def load_entities(path: Path) -> list[Entity]:
+    """Parse a dictionary/catalog file.
+
+    Line syntax:
+        TYPE|value                a single surface form
+        TYPE|value|alias|alias    extra surface forms of the same entity
+        value                     no `|` -> TYPE is ALTRO
+        @type X                   type for the entries that follow
+        @stem on|off              `Pincopallino` also matches `Pincopallino1`
+        @match case-sensitive     do not case-fold (proper nouns: `Ancona`, not `prato`)
+        @context <regex>          only match when preceded by this context
+        @context off              stop requiring a context for the entries that follow (the exact
+                                  token `off`; any other value is a regex, `no` included)
+
+    ORDERING RULE: every directive applies to the ENTRIES THAT FOLLOW IT, and a later directive
+    replaces the earlier one — the file is read top to bottom. So a `@context` is not a property of
+    the file: it is a property of the block it opens, and `@context off` is how you close it.
+
+    An unknown directive is a hard ERROR, never ignored: a typo in `@stem`/`@context` would
+    silently change what gets redacted, and silent under-redaction is a leak.
+    """
+    if not path.exists():
+        return []
+    return _load_entity_lines(str(path), path.read_text(encoding="utf-8").splitlines())
+
+
+def _load_entity_lines(display: str, lines: list[str]) -> list[Entity]:
+    """Parse dictionary lines — `load_entities` on a file, the write boundaries on candidate
+    content: one parser, so what a save validates is exactly what a load reads. `display` rides
+    the errors and the warnings, so a candidate reports the real file, never a temp probe."""
+    entries: list[Entity] = []
+    seen: set[tuple[str, str]] = set()
+    ptype, stem, case_sensitive, context = "ALTRO", False, False, None
+
+    for lineno, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("@"):
+            name, _, argument = line[1:].partition(" ")
+            name, argument = name.strip().lower(), argument.strip()
+            if name not in KNOWN_DIRECTIVES:
+                raise ValueError(f"{display}:{lineno}: unknown directive '@{name}'")
+            if name == "type":
+                if not argument:
+                    raise ValueError(f"{display}:{lineno}: @type needs a value")
+                if any(ch.isspace() for ch in argument):
+                    raise ValueError(
+                        f"{display}:{lineno}: the type {argument!r} contains a space — a type is one token "
+                        f"(the explicit line form is `TYPE|value`, the alias form `TYPE|value|alias`)"
+                    )
+                ptype = argument.upper()
+            elif name == "stem":
+                if argument.lower() not in _TRUE + _FALSE:
+                    raise ValueError(f"{display}:{lineno}: @stem takes on|off, not {argument!r}")
+                stem = argument.lower() in _TRUE
+            elif name == "match":
+                if argument.lower() not in ("case-sensitive", "sensitive", "insensitive", "case-insensitive", "i"):
+                    raise ValueError(f"{display}:{lineno}: @match takes case-sensitive|insensitive")
+                case_sensitive = argument.lower() in ("case-sensitive", "sensitive")
+            else:  # context
+                # ONLY the exact token `off` clears the context. Deliberately not the shared
+                # `_FALSE` list (`no`, `0`, `false`): those are legitimate @context REGEXES, and
+                # treating them as "off" would silently drop a gate the operator wrote.
+                if argument.lower() == "off":
+                    context = None
+                else:
+                    if not argument:
+                        raise ValueError(f"{display}:{lineno}: @context needs a regex (or 'off')")
+                    try:
+                        re.compile(argument)  # fail loudly on a broken context, not at match time
+                    except re.error as exc:
+                        # Normalized to ValueError so every bad-dictionary failure reaches the caller
+                        # as one error type (the CLI turns it into exit 2).
+                        raise ValueError(f"{display}:{lineno}: invalid @context regex: {exc}") from exc
+                    context = argument
+            continue
+
+        fields = [field.strip() for field in line.split("|")]
+        # A type is ONE token. Under an `@type`, `Persona Test|p.test@x.local` is what an operator
+        # writes when they mean `value|alias`; read silently it becomes TYPE=`Persona Test`,
+        # value=`p.test@x.local`, and the person's NAME is never redacted. A space in the first field
+        # is that mistake, so it fails loudly instead of leaking (the README once showed it).
+        if len(fields) >= 2 and fields[0] and any(ch.isspace() for ch in fields[0]):
+            raise ValueError(
+                f"{display}:{lineno}: the type {fields[0]!r} contains a space — a line is `TYPE|value`, "
+                f"and the alias form is `TYPE|value|alias` (under an `@type`: `value` or `|value|alias`)"
+            )
+        if len(fields) >= 2:
+            line_type = (fields[0] or ptype).upper()
+            forms = [form for form in fields[1:] if form]
+        else:
+            line_type, forms = ptype, [line]
+        if not forms:
+            print(f"anon: {display} line {lineno}: no value, skipped", file=sys.stderr)
+            continue
+        for declared in forms:
+            value = _clean_surface(display, lineno, declared)
+            key = (line_type, value.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            variants = _entity_regexes(
+                value, stem=stem, case_sensitive=case_sensitive, context=context
+            )
+            if not variants:
+                print(f"anon: {display} line {lineno}: '{line_type}' has no usable name, skipped", file=sys.stderr)
+                continue
+            if stem:
+                _warn_short_stem(display, lineno, value)
+            entries.extend(
+                Entity(
+                    line_type,
+                    value,
+                    variant.regex,
+                    first_token=variant.first_token,
+                    inner=variant.inner,
+                    context=variant.context,
+                    form=variant.form,
+                    line=lineno,
+                    case_sensitive=case_sensitive,
+                )
+                for variant in variants
+            )
+    # Longest surface first, so "Acme Italia" wins over "Acme".
+    entries.sort(key=lambda entity: len(entity.surface), reverse=True)
+    return entries
+
+
+def load_entities_many(paths: Iterable[Path]) -> list[Entity]:
+    """The custom dictionary plus every selected catalog, as one list."""
+    merged: list[Entity] = []
+    for path in paths:
+        merged.extend(load_entities(Path(path).expanduser()))
+    merged.sort(key=lambda entity: len(entity.surface), reverse=True)
+    return merged
+
+
+def dictionary_conflicts(
+    paths: Iterable[Path | str], texts: "dict[Path | str, str] | None" = None
+) -> list[dict[str, object]]:
+    """The same voce declared twice: same surface (case-insensitively), same context, any types.
+
+    Two such entries match the same text, and which TYPE claims the span is decided by file order:
+    deterministic, silent, and arbitrary from the operator's side. The load keeps the first, and
+    nothing leaks — the span is redacted either way — so this is a REPORT, not a refusal: the
+    write boundaries act on it (the dictionary save rejects it, the suggester never adds to it,
+    `--verify-dictionary` prints it).
+
+    The voce key is the casefolded surface, not `_fold_entity`: `Contoso` and `Contoso Srl` fold
+    together but match different spans — they are variants (near-miss territory), not duplicates.
+    Two case-sensitive entries with different raw surfaces (`Dell`, `dell`) match different texts
+    and do not conflict. Repeats the loader already drops (the same type and surface in one file)
+    are not re-reported; the same voce in two files is one, because the loader dedups per file.
+    The key is the NFC-normalized casefold: the engine matches an entry against the document's
+    OTHER Unicode form through its normalization variants, so NFC and NFD of the same word
+    claim the same span and are one voce here too.
+
+    `texts` maps a path to candidate content: that content is parsed instead of the file, and
+    the entry reports the path it was given — so the write boundaries can check the dictionary
+    that WOULD result, before saving anything. Keys are expanded like the paths, so a caller
+    that writes `~` is heard like one that writes the expanded form.
+    """
+    texts = {Path(key).expanduser(): value for key, value in texts.items()} if texts else texts
+    declarations: dict[tuple[str, str | None], dict[tuple[str, int, str], dict[str, object]]] = {}
+    for item in paths:
+        path = Path(item).expanduser()
+        candidate = texts.get(path) if texts else None
+        entities = (
+            _load_entity_lines(str(path), str(candidate).splitlines())
+            if candidate is not None else load_entities(path)
+        )
+        for entity in entities:
+            # One declaration can yield several entities (its Unicode forms): one report entry.
+            key = (str(path), entity.line, entity.type)
+            bucket = declarations.setdefault(
+                (unicodedata.normalize("NFC", entity.surface).casefold(), entity.context), {})
+            bucket.setdefault(key, {"path": str(path), "line": entity.line,
+                                     "type": entity.type, "value": entity.surface,
+                                     "case_sensitive": entity.case_sensitive})
+    conflicts: list[dict[str, object]] = []
+    for voce, bucket in sorted(declarations.items()):
+        entries = [bucket[key] for key in sorted(bucket)]
+        if len(entries) < 2:
+            continue
+        if (all(bool(entry["case_sensitive"]) for entry in entries)
+                and len({str(entry["value"]) for entry in entries}) > 1):
+            continue  # case-sensitive entries with different raw surfaces match different texts
+        conflicts.append({"surface": entries[0]["value"], "entries": entries})
+    return conflicts
+
+
+def _as_list(value) -> list[str]:
+    """Accept both a comma-separated CLI string and a JSON array (the web UI sends arrays).
+
+    Anything else is a malformed REQUEST: `{"catalogs": 5}` used to raise `TypeError` out of the
+    iteration and become a 500. It is a `ValueError` now, which the API answers with a 400.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise ValueError(f"expected a list of names, found {type(value).__name__}")
+
+
+def entity_count(entities: Iterable[Entity]) -> int:
+    """Distinct declared entries — not the internal per-normalization regex variants.
+
+    One accented or non-ASCII entry compiles to two patterns (NFC + NFD), so counting rules
+    would report `100 voci` for a 50-city catalog.
+    """
+    return len({(entity.type, entity.surface) for entity in entities})
+
+
+def catalog_path(name: str) -> Path:
+    return CATALOGS_DIR / (name if name.endswith(".txt") else f"{name}.txt")
+
+
+def list_catalogs() -> list[dict[str, object]]:
+    """Available catalogs (name, path, entry count) for `--list-catalogs` and the web UI."""
+    if not CATALOGS_DIR.is_dir():
+        return []
+    available = []
+    for path in sorted(CATALOGS_DIR.glob("*.txt")):
+        try:
+            count = entity_count(load_entities(path))
+        except ValueError:
+            count = -1
+        available.append({"name": path.stem, "path": str(path), "entries": count})
+    return available
+
+
+def load_allowlist(path: Path) -> list[str]:
+    """Path globs whose contents are never considered sensitive (e.g. a public repo)."""
+    if not path.exists():
+        return []
+    patterns: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            patterns.append(line)
+    return patterns
+
+
+def is_allowed(path: Path, patterns: Iterable[str]) -> bool:
+    expanded = path.expanduser()
+    # Match both the literal absolute path and the symlink-resolved one: on macOS
+    # /var -> /private/var, so a glob written by the user must match either form.
+    candidates = {os.path.abspath(str(expanded)), str(expanded.resolve())}
+    for pattern in patterns:
+        if fnmatch.fnmatch(expanded.name, pattern) or any(fnmatch.fnmatch(c, pattern) for c in candidates):
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class _ScanIndex:
+    """Precomputed fast-scan state for one entity list.
+
+    Built once and reused: the container path calls `entity_hits` once per XML part with the same
+    dictionary, and rebuilding the alternation and the sub-indexes for every part was pure cost.
+    Each bucket also carries a SUB-INDEX, so a position is resolved without probing every entry
+    that shares the first token (measured: cost was `matches × entries sharing the first token`,
+    i.e. quadratic — 10 000 synthetic entries over 11 first names meant 14.3M anchored probes).
+    """
+
+    literals: dict[str, list[Entity]]
+    alternation: re.Pattern[str] | None
+    # Members of each literal bucket that can match with the first token ALONE (a single-token
+    # surface, with an optional legal suffix or stem). A member with more tokens always needs the
+    # second one to be present, so it lives in `by_next` instead.
+    alone: dict[str, list[Entity]]
+    by_next: dict[str, dict[str, list[Entity]]]
+    next_re: dict[str, re.Pattern[str]]
+    # (context, form) -> (members of the group, members by their own first token, locator, pattern)
+    grouped: dict[
+        tuple[str, str],
+        tuple[list[Entity], dict[str, list[Entity]], re.Pattern[str] | None, re.Pattern[str]],
+    ]
+    direct: list[Entity]
+    # A word-character source is located by walking the word runs of the text and looking each
+    # prefix up in `literals`, which costs one dict probe per token instead of trying every source
+    # at every offset. `word_heads2`/`word_heads1` are the cheap reject before the probing: most
+    # tokens of a document share neither the first two characters nor the single first character of
+    # any source. `max_word_len` bounds the probing to the longest source there is.
+    word_heads2: frozenset[str] = frozenset()
+    word_heads1: frozenset[str] = frozenset()
+    max_word_len: int = 0
+
+
+# `re.IGNORECASE` folds a few characters that `str.casefold()` does not, and the scan keyed on the
+# casefold: the dictionary entry `İpek` and a document spelling it `ipek` DID agree under the
+# entry's own pattern, while their keys did not — so the scan never probed the position and the name
+# was left un-redacted, the worst defect this tool can have. The divergence is exhausted by
+# `test_the_locator_fold_covers_everything_ignorecase_matches`: over every character of Unicode that
+# has a case or a fold, the only family `casefold` separates is {I, İ, ı}, folded here first. A key
+# COARSER than `re.IGNORECASE` is always safe — it can only probe more candidates, and every
+# candidate is still verified with the anchored pattern.
+_LOCATOR_TRANSLATION = str.maketrans({"İ": "i", "ı": "i"})
+
+
+def _locator_key(value: str) -> str:
+    """The fold the scan keys on: at least as coarse as `re.IGNORECASE`, never finer."""
+    return value.translate(_LOCATOR_TRANSLATION).casefold()
+
+
+_INDEX_CACHE: dict[int, tuple[object, _ScanIndex]] = {}
+
+# The word runs of the text, as the entity patterns see them: `\w` is Unicode-aware in Python, the
+# same class `(?<!\w)` uses, so a run always starts where a literal entity could start.
+_WORD_RUN_RE = re.compile(r"\w+")
+
+# Below this number, one alternation is cheaper. Above it, walking text word runs and checking
+# indexed prefixes avoids repeating work across common words and dictionary entries. Both paths must
+# return the same spans; a regression test compares them against the same corpus.
+SCAN_WORD_SOURCES_MIN = 72
+
+
+
+
+
+def _build_scan_index(
+    entities: list[Entity], word_min: int = SCAN_WORD_SOURCES_MIN
+) -> _ScanIndex:
+    literals: dict[str, list[Entity]] = {}
+    sources: set[str] = set()
+    groups: dict[tuple[str, str], list[Entity]] = {}
+    direct: list[Entity] = []
+    for entity in entities:
+        if not entity.first_token or not entity.inner:
+            direct.append(entity)
+        elif entity.context:
+            groups.setdefault((entity.context, entity.form), []).append(entity)
+        else:
+            literals.setdefault(_locator_key(entity.first_token), []).append(entity)
+            sources.add(entity.first_token)
+
+    alone: dict[str, list[Entity]] = {}
+    by_next: dict[str, dict[str, list[Entity]]] = {}
+    next_re: dict[str, re.Pattern[str]] = {}
+    for token, bucket in literals.items():
+        single: list[Entity] = []
+        second: dict[str, list[Entity]] = {}
+        # The PATTERN is built from the raw token, the LOOKUP key from its casefold: `casefold()`
+        # and `re.IGNORECASE` are not the same fold (ß -> ss, the ﬁ/ﬂ/ﬃ ligatures, İ, µ), so using
+        # the folded string as the pattern silently stopped matching a real name — an un-redacted
+        # name in the output, which is the worst defect this tool can have. The first-token
+        # alternation always worked this way; the sub-index must too.
+        raw_second: dict[str, str] = {}
+        for entity in bucket:
+            tokens = _name_tokens(entity.surface)
+            if len(tokens) > 1:
+                raw = unicodedata.normalize(entity.form, tokens[1])
+                key = _locator_key(raw)
+                second.setdefault(key, []).append(entity)
+                raw_second.setdefault(key, raw)
+            else:
+                single.append(entity)
+        alone[token] = single
+        if second:
+            by_next[token] = second
+            branches = "|".join(
+                re.escape(raw) for raw in sorted(raw_second.values(), key=len, reverse=True)
+            )
+            # Locates the SECOND token of any member of this bucket. Longest first, like the
+            # first-token alternation, so the caller can probe the prefixes for a shorter member.
+            next_re[token] = re.compile(
+                rf"(?:{NAME_SEPARATOR_RE})(?P<next>{branches})", re.IGNORECASE
+            )
+
+    # Two locators avoid repeating work across every token and dictionary entry. Every literal
+    # entity carries a `(?<!\w)` prefix, so a match can only
+    # ever START where a word run starts: a source made of word characters is therefore located by
+    # walking the word runs and probing their prefixes (dict lookups, no regex), and only a source
+    # holding a non-word character — `D-Link`, `Hyper-V`, `PAN-OS` — still needs an alternation.
+    word_sources: set[str] = set()
+    other_sources: set[str] = set()
+    for source in sources:
+        (word_sources if _WORD_RUN_RE.fullmatch(source) else other_sources).add(source)
+    if len(word_sources) < word_min:
+        # A small dictionary is cheaper to locate with one alternation, which is what every earlier
+        # version did: the word walk has a per-token floor that a handful of sources does not earn
+        # back. Both paths are equally correct — the equivalence test runs the same corpus through
+        # each — so this is only a choice of which one costs less.
+        other_sources |= word_sources
+        word_sources = set()
+
+    alternation = None
+    if other_sources:
+        # Longest first: the alternation takes the FIRST branch that matches at a position, and this
+        # way that is also the longest — the choice the overlap resolver makes anyway. It is
+        # superset-safe: every candidate is still verified anchored below. NOT wrapped in a lookahead:
+        # a zero-width pattern makes the engine try every offset, which cost 17% on the guard's path,
+        # and `_alternation_hits` reaches the positions `finditer` skips by probing inside a match.
+        alternation = re.compile(
+            "|".join(
+                re.escape(source) for source in sorted(other_sources, key=len, reverse=True)
+            ),
+            re.IGNORECASE,
+        )
+
+    word_heads2: set[str] = set()
+    word_heads1: set[str] = set()
+    max_word_len = 0
+    for source in word_sources:
+        key = _locator_key(source)
+        max_word_len = max(max_word_len, len(source))
+        if len(key) >= 2:
+            word_heads2.add(key[:2])
+        else:
+            # A one-character source has no second character to index on; keeping its only
+            # character in a set of its own means the reject below cannot hide it.
+            word_heads1.add(key)
+
+    grouped: dict[
+        tuple[str, str],
+        tuple[list[Entity], dict[str, list[Entity]], re.Pattern[str] | None, re.Pattern[str]],
+    ] = {}
+    for (context, _form), members in groups.items():
+        # Same order as the caller's list (longest surface first), so a city catalog inside one
+        # context keeps the behavior of one scan per entry. The context is a NAMED group: the
+        # member starts where it ends, and a context like `(?:comune di|sede di)\s+` consumes
+        # whitespace, so `match.start()` is not the member's position.
+        branches = "|".join(
+            f"(?P<e{index}>{member.inner})" for index, member in enumerate(members)
+        )
+        compiled = re.compile(
+            f"(?P<ctx>{context})(?<!\\w)(?:{branches})(?!\\w)", re.IGNORECASE
+        )
+        by_first: dict[str, list[Entity]] = {}
+        raw_first: dict[str, str] = {}  # same rule as above: pattern from the raw token
+        for member in members:
+            key = _locator_key(member.first_token)
+            by_first.setdefault(key, []).append(member)
+            raw_first.setdefault(key, member.first_token)
+        locator = None
+        if by_first:
+            first_branches = "|".join(
+                re.escape(raw) for raw in sorted(raw_first.values(), key=len, reverse=True)
+            )
+            locator = re.compile(first_branches, re.IGNORECASE)
+        grouped[(context, _form)] = (members, by_first, locator, compiled)
+
+    return _ScanIndex(
+        literals=literals,
+        alternation=alternation,
+        alone=alone,
+        by_next=by_next,
+        next_re=next_re,
+        grouped=grouped,
+        direct=direct,
+        word_heads2=frozenset(word_heads2),
+        word_heads1=frozenset(word_heads1),
+        max_word_len=max_word_len,
+    )
+
+
+def _scan_index(entities: Iterable[Entity]) -> _ScanIndex:
+    """`_build_scan_index` with an identity-keyed cache (the same list is passed again and again)."""
+    if isinstance(entities, list):
+        cached = _INDEX_CACHE.get(id(entities))
+        if cached is not None and cached[0] is entities:
+            return cached[1]
+    index = _build_scan_index(list(entities))
+    if isinstance(entities, list):
+        if len(_INDEX_CACHE) > 3:  # a run holds one dictionary; keep the cache trivially bounded
+            _INDEX_CACHE.clear()
+        _INDEX_CACHE[id(entities)] = (entities, index)
+    return index
+
+
+def _word_run_hits(index: _ScanIndex, text: str):
+    r"""Locate the word-character sources by walking the word runs of the text.
+
+    One dict probe per token prefix, where the alternation it replaced made the regex engine try
+    every source at every offset. Sound because every literal entry carries a `(?<!\w)` prefix, so a
+    match can only START where a word run starts; every candidate is verified anchored anyway.
+    """
+    if not index.max_word_len:
+        return
+    literals = index.literals
+    # The two sets reject a token that shares no opening with any source before any probing happens.
+    # Compare the TRUNCATED fold: `casefold` can lengthen a character (`İ` -> two characters), so
+    # folding two raw characters can give three characters and would never equal a two-character
+    # head — a source opening with such a character would be silently unreachable.
+    heads2 = index.word_heads2
+    heads1 = index.word_heads1
+    longest = index.max_word_len
+    for run in _WORD_RUN_RE.finditer(text):
+        token = run.group(0)
+        start = run.start()
+        if _locator_key(token[:2])[:2] not in heads2 and _locator_key(token[:1]) not in heads1:
+            continue
+        for end in range(1, min(len(token), longest) + 1):
+            key = _locator_key(token[:end])
+            if key not in literals:
+                continue
+            for entity in _literal_candidates(index, text, start, end, key):
+                anchored = entity.regex.match(text, start)
+                if anchored is not None:
+                    span_start, span_end = anchored.span(ENTITY_GROUP)
+                    yield entity, span_start, span_end
+
+
+def _alternation_hits(index: _ScanIndex, text: str):
+    r"""Locate the remaining sources — the ones holding a non-word character — with one alternation.
+
+    `D-Link`, `Hyper-V`, `PAN-OS`: no word run can carry them. When the dictionary is small this
+    locator takes every word-character source TOO (see `SCAN_WORD_SOURCES_MIN`), which is what every
+    earlier version did and is cheaper than the word walk for a handful of names.
+    """
+    if index.alternation is None:
+        return
+    literals = index.literals
+
+    def probe(start: int, matched: str):
+        r"""Yield every entry that can start at `start`, given the alternation matched `matched`.
+
+        The alternation takes the FIRST branch that matches, so a longer literal hides a shorter one
+        starting at the same offset: with `@stem on` on `Ferretti` behind the literal `Ferrettini`,
+        `Ferrettini` wins and the stem entry — whose `[\w\-]*` DOES match that word — would never be
+        probed. Every prefix of the matched text is looked up too, so the shorter entry gets its
+        anchored chance.
+        """
+        for end in range(1, len(matched) + 1):
+            key = _locator_key(matched[:end])
+            if key not in literals:
+                continue
+            for entity in _literal_candidates(index, text, start, end, key):
+                anchored = entity.regex.match(text, start)
+                if anchored is not None:
+                    yield entity, *anchored.span(ENTITY_GROUP)
+
+    for match in index.alternation.finditer(text):
+        matched = match.group(0)
+        start = match.start()
+        yield from probe(start, matched)
+        # `finditer` resumes at the END of a match, so a source nested inside a longer one was never
+        # probed: declaring `A-B-C` and `B-C` found `A-B-C` and left `B-C` untouched in `a-b-c`, and
+        # `D-Link` next to `Link` did the same (measured: 1987 of 2000 random `X-Y-Z`/`Y-Z` pairs).
+        # Every position a match does NOT reach is found by `finditer`, so probing the positions
+        # strictly inside this one closes the gap — and it costs nothing when nothing nests, because
+        # matches are rare on the guard's path and few on a document with the catalogs.
+        for inner in range(start + 1, start + len(matched)):
+            inner_match = index.alternation.match(text, inner)
+            if inner_match is not None:
+                yield from probe(inner, inner_match.group(0))
+
+
+def _literal_candidates(
+    index: _ScanIndex, text: str, start: int, end: int, key: str
+) -> Iterable[Entity]:
+    """The entities that can start at `start`, given that `text[start:end]` spells the first token.
+
+    Shared by both locators so the two cannot drift apart. It only ever NARROWS the work: every
+    candidate is verified afterwards with the entity's own anchored pattern, so a locator can never
+    widen what is redacted — the worst it can do is cost time.
+    """
+    candidates: Iterable[Entity] = index.alone.get(key, ())
+    locator = index.next_re.get(key)
+    if locator is not None:
+        following = locator.match(text, start + end)
+        if following is not None:
+            found_token = following.group("next")
+            second = index.by_next[key]
+            extra: list[Entity] = []
+            for end2 in range(1, len(found_token) + 1):
+                matches_second = second.get(_locator_key(found_token[:end2]))
+                if matches_second:
+                    extra.extend(matches_second)
+            if extra:
+                candidates = list(candidates) + extra
+    return candidates
+
+
+def entity_hits(text: str, entities: Iterable[Entity]):
+    """Yield (entity, start, end) for every dictionary occurrence, with the same matches
+    `Entity.spans` produces — but without one full-text pass per entry.
+
+    That per-entry pass was the whole cost of a scan: a 200-entry dictionary compiles to 400
+    patterns (one per normalization form) and took 13.5s of 13.7s on 2 MB (scripts/bench-check.py).
+    Three stages instead:
+
+      * entries without a `@context` are located by TWO locators: a source made of word characters
+        is found by walking the word runs of the text and looking each prefix up in the index, one
+        dict probe per prefix, while the handful of sources holding a non-word character (`D-Link`,
+        `Hyper-V`) are found by one case-insensitive alternation. Both are supersets: every
+        candidate is verified ANCHORED at its position, with the very match `finditer` would have
+        returned, because a context-free entry always starts at its first token;
+      * the word-run locator avoids an alternation over every source, which would repeat work across
+        positions and common words. A position yields only the entries whose NEXT
+        token is present in the text (or which can match on the first token alone), so the cost does
+        not grow with the number of entries that merely share a first name;
+      * entries WITH a `@context` cannot be found that way (their match starts at the context),
+        so they are grouped by (context, normalization form) and scanned once per group, with the
+        same first-token sub-index inside the group;
+      * an entry built by hand (no scan metadata) is scanned directly: never skipped, so a caller
+        cannot silence an entry by omitting a field.
+
+    The sub-index only ever REMOVES candidates that cannot match (a member with two tokens needs
+    its second token to be in the text), and every candidate is still verified with the same
+    anchored match, so the yielded set is identical to the reference scan.
+    """
+    index = _scan_index(entities)
+    yield from _word_run_hits(index, text)
+    yield from _alternation_hits(index, text)
+
+    for (context, _form), (members, by_first, locator, grouped) in index.grouped.items():
+        for match in grouped.finditer(text):
+            # The group pattern only LOCATES the context positions; each member is then verified
+            # anchored there, exactly as above. An alternation reports one branch per position, so
+            # reading the matched group would silently drop `Roma` when `Roma Nord` is declared in
+            # the same context — the reference scan yields both, and the overlap resolver decides.
+            start = match.start()
+            candidates = members
+            if locator is not None:
+                member_start = match.end("ctx")
+                following = locator.match(text, member_start)
+                if following is None:
+                    continue  # no member's first token is here: nothing can match at this position
+                found_token = following.group(0)
+                narrowed: list[Entity] = []
+                for end2 in range(1, len(found_token) + 1):
+                    matches_first = by_first.get(_locator_key(found_token[:end2]))
+                    if matches_first:
+                        narrowed.extend(matches_first)
+                if not narrowed:
+                    continue
+                candidates = narrowed
+            for member in candidates:
+                anchored = member.regex.match(text, start)
+                if anchored is not None:
+                    span_start, span_end = anchored.span(ENTITY_GROUP)
+                    yield member, span_start, span_end
+
+    for entity in index.direct:
+        for start, end, _value in entity.spans(text):
+            yield entity, start, end
+
+
+def detect(
+    text: str,
+    entities: list[Entity],
+    include_heuristics: bool = True,
+    families: Iterable[str] | None = None,
+) -> list[tuple[int, int, str]]:
+    """Return non-overlapping (start, end, TYPE) spans of sensitive content, in order.
+
+    The match runs on the text with the INVISIBLE characters taken out (a value carrying a soft
+    hyphen is the value the operator declared, not a different name): the spans are returned in
+    the coordinates of `text` AS GIVEN, invisible characters included — the caller rewrites the
+    original, and the map keeps the raw source, so the restore writes the exact bytes back.
+
+    `families` limits which pattern groups run (None = all). The curated dictionary is always
+    applied: it is the operator's own list, not a default.
+    """
+    text, _source = invisible_free(text)
+    claimed = bytearray(len(text))
+    candidates: list[tuple[int, int, int, str, str]] = []
+
+    # Protect existing placeholders so anonymizing twice is a no-op.
+    for match in PLACEHOLDER_RE.finditer(text):
+        claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
+
+    def collect(start: int, end: int, priority: int, ptype: str, value: str) -> None:
+        if end <= start or any(claimed[start:end]) or _is_safe(value):
+            return
+        candidates.append((start, end, priority, ptype, value))
+
+    def apply(rule: Rule, priority: int) -> None:
+        if families is not None and rule.family not in families:
+            return
+        for match in rule.regex.finditer(text):
+            group = rule.capture
+            if group and match.group(group) is None:
+                continue
+            start, end = (match.start(group), match.end(group)) if group else (match.start(), match.end())
+            if rule.trim_trailing:
+                while end > start and text[end - 1] in rule.trim_trailing:
+                    end -= 1
+            value = text[start:end]
+            if rule.validator is not None and not rule.validator(value):
+                shrunk: str | None = None
+                if rule.shrink_labels:
+                    # `db01.azienda.local.log`: drop trailing labels until the hostname is recovered.
+                    candidate = value
+                    while "." in candidate:
+                        candidate = candidate.rsplit(".", 1)[0]
+                        if rule.validator(candidate):
+                            shrunk = candidate
+                            break
+                elif rule.shrink_words:
+                    # `IT60 … 456 entro`: drop trailing whitespace-separated tokens until the
+                    # checksum accepts the longest valid prefix.
+                    candidate = value.rstrip()
+                    while True:
+                        head, separator, _tail = candidate.rpartition(" ")
+                        if not separator:
+                            break
+                        candidate = head.rstrip()
+                        if rule.validator(candidate):
+                            shrunk = candidate
+                            break
+                if shrunk is None:
+                    continue
+                end, value = start + len(shrunk), shrunk
+            collect(start, end, priority, rule.type, value)
+
+    for index, rule in enumerate(RULES):
+        apply(rule, index)
+    for entity, start, end in entity_hits(text, entities):
+        collect(start, end, ENTITY_PRIORITY, entity.type, text[start:end])
+    if include_heuristics:
+        for index, rule in enumerate(HEURISTIC_RULES):
+            apply(rule, HEURISTIC_PRIORITY + index)
+
+    # Resolve overlaps by LONGEST match, not by evaluation order: a curated name inside a hostname
+    # (`srv-crm01.local`) must give way to the hostname, or the redaction would be partial
+    # (`srv-crm01.[AZIENDA-1].local`) and leave the host readable.
+    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0]), item[2]))
+    found: list[tuple[int, int, str]] = []
+    for start, end, _priority, ptype, _value in candidates:
+        if any(claimed[start:end]):
+            continue
+        claimed[start:end] = b"\x01" * (end - start)
+        if _source is not None:  # back to the coordinates of the text AS GIVEN
+            found.append((_source[start], _source[end - 1] + 1, ptype))
+        else:
+            found.append((start, end, ptype))
+    return found
+
+
+class _Placeholders:
+    """Per-run placeholder allocation, shared by the text path and the container path.
+
+    One instance per document/run: `[EMAIL-1-tag]` must mean the same value in `document.xml` and
+    in `header1.xml`, or the map would describe two different things under one key. The numbering
+    and the reserved-token rule live here once, so the two paths cannot drift apart.
+    """
+
+    def __init__(self, tag: str | None, reserved: Iterable[str] = ()) -> None:
+        self.tag = tag or new_tag()
+        self.by_key: dict[tuple[str, str], str] = {}
+        self.counters: dict[str, int] = {}
+        self.entries: dict[str, dict[str, str]] = {}
+        # Placeholder-shaped text already in the source must not be reused as a FRESH placeholder:
+        # `[EMAIL-1] e info@acme.local` would otherwise map the literal `[EMAIL-1]` to the new value,
+        # and deanon would rewrite both.
+        self.reserved = set(reserved)
+
+    def for_value(self, ptype: str, value: str) -> str:
+        known = self.by_key.get((ptype, value))
+        if known is not None:
+            return known
+        suffix = f"-{self.tag}" if self.tag else ""
+        while True:
+            self.counters[ptype] = self.counters.get(ptype, 0) + 1
+            candidate = f"[{ptype}-{self.counters[ptype]}{suffix}]"
+            if candidate not in self.reserved:
+                break
+        self.reserved.add(candidate)
+        self.by_key[(ptype, value)] = candidate
+        self.entries[candidate] = {"type": ptype, "original": value}
+        return candidate
+
+    def counts(self) -> dict[str, int]:
+        # Recomputed from the entries: `counters` also advances past reserved numbers, so it would
+        # over-report (e.g. {"EMAIL": 2} for a single entry) in the map summary.
+        counts: dict[str, int] = {}
+        for entry in self.entries.values():
+            counts[entry["type"]] = counts.get(entry["type"], 0) + 1
+        return counts
+
+
+def group_runs(offsets: Iterable[int]) -> list[list[int]]:
+    """Group raw offsets into the contiguous runs they came from.
+
+    A value (or a placeholder) that a word processor split across runs arrives as offsets with
+    gaps: `"Persona "` in one `<w:t>` and `"Test"` in the next.
+    """
+    runs: list[list[int]] = []
+    for position in offsets:
+        if runs and position == runs[-1][-1] + 1:
+            runs[-1].append(position)
+        else:
+            runs.append([position])
+    return runs
+
+
+def anonymize(
+    text: str,
+    entities: list[Entity],
+    include_heuristics: bool = True,
+    families: Iterable[str] | None = None,
+    tag: str | None = None,
+) -> tuple[str, dict[str, dict[str, str]], dict[str, int]]:
+    """Replace sensitive spans with stable placeholders. Returns (redacted, entries, counts).
+
+    Every placeholder carries a `tag` identifying the map it belongs to (`[EMAIL-1-a3f9]`), so a
+    document can only be de-anonymized with ITS map. `tag=None` generates a fresh one.
+    """
+    found = detect(text, entities, include_heuristics, families)
+    alloc = _Placeholders(tag, (m.group(0) for m in PLACEHOLDER_RE.finditer(text)))
+    out: list[str] = []
+    cursor = 0
+    for start, end, ptype in found:
+        out.append(text[cursor:start])
+        out.append(alloc.for_value(ptype, text[start:end]))
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out), alloc.entries, alloc.counts()
+
+
+class UnreadableContainer(ValueError):
+    """A `.docx`-looking file that is not a readable ZIP: fake, or corrupt.
+
+    Refused with the same words as any other binary (`REFUSED`, `binary`), because that is what it
+    is: a familiar extension must not make the refusal vaguer.
+    """
+
+
+# Elements that do NOT make a new text container: a word processor splits a value with exactly
+# these — a run, a run property, a tab or a break, a bookmark, a hyperlink, a content control, a
+# proofing mark, an Office rich-text run. `xlsx` and `odt` have unprefixed equivalents (`t`, `r`).
+INLINE_ELEMENTS = frozenset({
+    # the text nodes, one per format
+    "w:t", "w:delText", "w:instrText", "a:t", "text:s", "text:tab", "text:line-break",
+    "t", "m:t",
+    # runs and inline wrappers, i.e. everything that can sit BETWEEN two fragments of one sentence
+    "w:r", "w:rPr", "w:proofErr", "w:noProof", "w:lastRenderedPageBreak", "w:fldSimple",
+    "w:fldChar", "w:tab", "w:br", "w:cr", "w:ptab", "w:softHyphen", "w:noBreakHyphen", "w:sym",
+    "w:pgNum", "w:footnoteRef", "w:endnoteRef", "w:commentReference", "w:annotationRef",
+    "w:separator", "w:continuationSeparator", "w:drawing", "w:object", "w:ruby", "w:rt",
+    "w:bookmarkStart", "w:bookmarkEnd", "w:commentRangeStart", "w:commentRangeEnd",
+    "w:permStart", "w:permEnd", "w:customXml", "w:moveFrom", "w:moveTo",
+    "w:hyperlink", "w:sdt", "w:sdtContent", "w:ins", "w:del", "w:smartTag", "w:subDoc",
+    "a:r", "a:rPr", "a:endParaRPr", "a:br", "a:tab", "a:fld",
+    "text:span", "text:a", "text:bookmark-start", "text:bookmark-end",
+    "r", "rPr", "m:r", "m:rPr",
+})
+
+
+def _element_name(tag: str) -> tuple[str, bool, bool] | None:
+    """(name, closing, self_closing) for an element tag; None for a declaration, comment or doctype."""
+    if not tag.startswith("<"):
+        return None
+    inner = tag[1:-1].strip() if tag.endswith(">") else tag[1:].strip()
+    if not inner or inner[0] in "?!":
+        return None
+    closing = inner.startswith("/")
+    body = inner[1:].strip() if closing else inner
+    self_closing = body.endswith("/")
+    name = body.rstrip("/").strip().split(" ")[0].strip()
+    return (name, closing, self_closing) if name else None
+
+
+def _segment_at(segments, column: int, key) -> tuple:
+    """The segment whose start is the last at or before `key` (the segments are sorted by it)."""
+    low, high = 0, len(segments) - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if key(segments[middle]) <= column:
+            low = middle
+        else:
+            high = middle - 1
+    return segments[low]
+
+
+def path_at_visible(segments, index: int) -> tuple:
+    """The element path the visible character at `index` lives in."""
+    return _segment_at(segments, index, lambda segment: segment[0])[2]
+
+
+def path_at_source(segments, offset: int) -> tuple:
+    """The element path the SOURCE character at `offset` lives in (what the restore direction has)."""
+    return _segment_at(segments, offset, lambda segment: segment[1])[2]
+
+
+def container_signature(path) -> tuple:
+    """The CONTAINERS a fragment lives in: every ancestor that is not an inline element.
+
+    Comparing signature with signature is what answers "are these two halves of one sentence, or two
+    different pieces of the document?" — and it has to look at the WHOLE path, not at the first
+    difference: a text box inside a run differs from the body first at `w:r` (inline, harmless) while
+    the real boundary is the `w:p` nested three levels down inside `w:drawing`/`w:txbxContent`. A
+    version that stopped at the first differing element returned "safe" there and deleted the text
+    box's content.
+    """
+    return tuple(entry for entry in path if entry[0] not in INLINE_ELEMENTS)
+
+
+# Self-closing tags that RENDER whitespace: a tab, a line break, a run of spaces. In the
+# reader's view (separator=None) the runs of one block join with nothing, so these are the tags
+# that must still contribute their whitespace — without them a tab between two words would glue
+# them into a value that is not in the document (over-redaction by invention).
+WHITESPACE_TAGS = frozenset({
+    "w:tab", "w:br", "w:cr", "w:ptab", "w:sym",  # Word: tab, break, symbol
+    "text:tab", "text:line-break", "text:s",     # ODT: tab, break, spaces
+    "a:br", "a:tab",                               # DrawingML: break, tab
+})
+
+# The parts whose text is FLOW — paragraphs, runs, cells — where a reader sees the fragments of
+# one block JOINED. Everything else (docProps, customXml, ODF meta) is a LIST of separate values:
+# those keep the conservative one-space-per-tag view, where a merge would invent a value that is
+# not in the document (a TEL made of the digits of two properties was refused for exactly this).
+FLOW_PART = re.compile(
+    r"^(word/(document|header[0-9]*|footer[0-9]*|footnotes|endnotes|comments|glossary/document)\.xml"
+    r"|content\.xml"
+    r"|ppt/(slides|notesSlides|notesMasters|slideLayouts|slideMasters)/[^/]+\.xml"
+    r"|xl/(worksheets/[^/]+\.xml|sharedStrings\.xml))$"
+)
+
+
+def boundary_offenders(left, right) -> list[str]:
+    """The containers that differ between two fragments, or [] when joining them is safe.
+
+    Two runs of one sentence share every container, so their signatures are equal and the value is
+    rewritten; `</w:p><w:p>`, `</dc:title><dc:creator>` or body-vs-text-box do not, and emptying the
+    second fragment would delete text that belongs to the document rather than to the match.
+    """
+    mine, theirs = container_signature(left), container_signature(right)
+    if mine == theirs:
+        return []
+    names = {name for name, _id in mine}
+    names |= {name for name, _id in theirs}
+    differing = [entry for entry in mine if entry not in theirs]
+    differing += [entry for entry in theirs if entry not in mine]
+    return sorted({name for name, _id in differing}) or sorted(names)
+
+
+def masked_index(
+    xml: str, part: str = ""
+) -> tuple[str, array.array, list[tuple[int, int, tuple]]]:
+    """(the text a reader of the document sees, the source offset of every character — -1 for an
+    inserted separator — and one (visible start, source start, element path) per text segment).
+
+    `part` names the part being viewed: a FLOW part (document, header, footer, slide, sheet) gets
+    the reader's view — the runs of one block joined, which is how the document renders them —
+    while any other part (a properties part, a custom-XML part) keeps the conservative
+    one-space-per-tag view where two values can never merge.
+
+    This is the view `detect` runs on, so it must be the text the OPERATOR reads in the document:
+    the runs of one block join with nothing (a word Word split across `BeS`|`afe` renders as
+    `BeSafe` — rsid fragmentation — and a flat one-space-per-tag view missed it, which is how a
+    company stayed in clear in a delivered file while the run reported success), while a NEW block —
+    a paragraph, a cell, a property — and a tag that itself renders whitespace contribute one
+    space, so `</dc:title><dc:creator>` never merges `Contoso` and `Persona` into one word (that is
+    exactly how a document property escaped redaction once).
+
+    `visible_index` CONCATENATES fragments instead — what a self-delimiting token (`[EMAIL-1]`)
+    needs — and it stays that way for the restore direction.
+
+    The paths are what the caller needs to tell "Word split a run" from "two paragraphs happened to
+    end and start with the right words": joining the second kind takes text from ANOTHER container,
+    so it is refused instead of rewritten (`boundary_offenders`). Both directions need this, which is
+    why the segments carry the source start as well: the restore path has source offsets, not visible
+    ones.
+    """
+    return _walk_parts(xml, None if FLOW_PART.fullmatch(part) else " ")
+
+
+# Decompression caps. `zipfile` inflates a part into memory before anyone can look at it, and the
+# per-character index below costs one int and one 1-char str per character (~40-80x the text), so an
+# unbounded part is both a memory and a time hole — reachable from `--check` and related document checks. These are the boundaries of "a document", not a policy: over them the container
+# is REFUSED (fail-closed), never half-processed.
+CONTAINER_MAX_PART_BYTES = 64 * 1024 * 1024
+CONTAINER_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+CONTAINER_MAX_RATIO = 200
+
+
+def _guard_part(info: zipfile.ZipInfo, running_total: int, max_total: int = CONTAINER_MAX_TOTAL_BYTES) -> int:
+    """The running decompressed size, or UnreadableContainer when a part is out of bounds."""
+    if info.file_size > CONTAINER_MAX_PART_BYTES:
+        raise UnreadableContainer(
+            f"REFUSED — part {info.filename} declares {info.file_size} uncompressed bytes "
+            f"(over {CONTAINER_MAX_PART_BYTES}): binary or a bomb. Nothing was written."
+        )
+    if info.compress_size and info.file_size > max(4096, CONTAINER_MAX_RATIO * info.compress_size):
+        raise UnreadableContainer(
+            f"REFUSED — part {info.filename} expands {info.file_size // max(info.compress_size, 1)}x "
+            f"its compressed size (over {CONTAINER_MAX_RATIO}x): binary or a bomb. Nothing was written."
+        )
+    total = running_total + info.file_size
+    if total > max_total:
+        raise UnreadableContainer(
+            f"REFUSED — the parts expand past {max_total} bytes: binary or a bomb. "
+            "Nothing was written."
+        )
+    return total
+
+
+class UnreadablePart(UnreadableContainer):
+    """A part that cannot be decoded as text although its name says it is text.
+
+    Passing it through unscanned would deliver a document with a value still inside, and the
+    verification would not see it either (same view, same blind spot). Refused instead.
+    """
+
+
+def open_container(src: Path) -> zipfile.ZipFile:
+    try:
+        return zipfile.ZipFile(src)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise UnreadableContainer(
+            f"REFUSED — {src} looks like an office document but is not a readable ZIP "
+            f"(binary or corrupt: {type(exc).__name__}). Nothing was written."
+        ) from exc
+
+
+def audit_container(
+    path: Path, entities, *, families: Iterable[str] | None = None,
+    include_heuristics: bool = True, max_total: int = CONTAINER_MAX_TOTAL_BYTES,
+) -> tuple[str, list[tuple[int, int, str]]]:
+    """(the reader's text, every finding of BOTH views positioned in it).
+
+    The check and the audit answer with this, not with `detect(container_text(...))`: their
+    verdict must see AT LEAST what the rewrite sees — a value split across runs with no space
+    is invisible to the reader's view but is still the client in the document — otherwise the
+    audit would call 'already anonymized' a file the redaction itself would still redact, and
+    the guard trusts that verdict. Findings of the flat view are mapped into the reader's
+    coordinates through their source positions, so the report keeps pointing at the line the
+    operator actually reads.
+    """
+    text_parts: list[str] = []
+    found: list[tuple[int, int, str]] = []
+    with open_container(path) as archive:
+        total = 0
+        base = 0
+        for info in archive.infolist():
+            total = _guard_part(info, total, max_total)
+            xml, _codec = decode_part(archive.read(info))
+            if xml is None and is_text_part(info.filename):
+                raise UnreadablePart(
+                    f"REFUSED — part {info.filename} is named as text but is not decodable: it "
+                    "cannot be scanned, so a value inside it could not be found. Nothing was written."
+                )
+            if xml is None:
+                continue
+            visible, offsets, _segments = masked_index(xml, info.filename)
+            candidates: list[tuple[int, int, str]] = []
+            for start, end, ptype in detect(visible, entities, include_heuristics, families):
+                candidates.append((base + start, base + end, ptype))
+            if FLOW_PART.fullmatch(info.filename):
+                # the second view: mapped back into the reader's coordinates by source position
+                at_source = {position: index for index, position in enumerate(offsets) if position >= 0}
+                flat, flat_offsets, _flat_segments = _walk_parts(xml, " ")
+                for start, end, ptype in detect(flat, entities, include_heuristics, families):
+                    raw = [p for p in flat_offsets[start:end] if p >= 0]
+                    if raw and raw[0] in at_source and raw[-1] in at_source:
+                        begin = base + at_source[raw[0]]
+                        close = base + at_source[raw[-1]] + 1
+                        if (begin, close, ptype) not in candidates:
+                            candidates.append((begin, close, ptype))
+            candidates.sort(key=lambda item: (item[0], item[1] - item[0], item[2]))
+            found.extend(candidates)
+            text_parts.append(visible)
+            base += len(visible) + 1  # the parts are joined with a newline
+    return "\n".join(text_parts), found
+
+
+def container_text(src: Path, max_total: int = CONTAINER_MAX_TOTAL_BYTES) -> str:
+    """The visible text of EVERY text part, joined: what a reader of the container sees.
+
+    `max_total` is the caller's budget. `--check` passes `SCAN_MAX_BYTES`, because that check is
+    what a content check scans: beyond its own budget the honest answer is "unscannable"
+    (fail-closed), not an unbounded scan.
+    """
+    chunks: list[str] = []
+    with open_container(src) as archive:
+        total = 0
+        for info in archive.infolist():
+            total = _guard_part(info, total, max_total)
+            text, _codec = decode_part(archive.read(info))
+            if text is None and is_text_part(info.filename):
+                raise UnreadablePart(
+                    f"REFUSED — part {info.filename} is named as text but is not decodable: it "
+                    "cannot be scanned, so a value inside it could not be found. Nothing was written."
+                )
+            if text is not None:
+                # The SAME view the rewrite detects on: verifying on a different one is how the
+                # first version reported "0 leftovers" while the document properties were intact.
+                chunks.append(masked_index(text, info.filename)[0])
+    return "\n".join(chunks)
+
+
+def _views_of(xml: str, part: str) -> list[tuple[str, array.array, list[tuple[int, int, tuple]]]]:
+    """The views a part is matched on — and why there can be TWO.
+
+    The reader's view (`separator=None`) joins the fragments of one block, because that is how
+    the document RENDERS them: a name Word split mid-word (`BeS`|`afe`, rsid fragmentation) is
+    `BeSafe` on screen, and no other view can find it. The flat view (one space per tag) sees a
+    separator BETWEEN two runs, which is what a value split across a run boundary without a
+    space needs (`Contoso`|`S.r.l.`: the reader's view glues it into `ContosoS.r.l.` — a token
+    the matcher must not split — while the flat view reads `Contoso S.r.l.`).
+
+    A part that is not FLOW (docProps, customXml) is a LIST of separate values, not a text: the
+    flat view alone keeps two values from merging into a word that is not in the document.
+    """
+    flat = _walk_parts(xml, " ")
+    return [_walk_parts(xml, None), flat] if FLOW_PART.fullmatch(part) else [flat]
+
+
+def container_findings(
+    xml: str, part: str, entities, include_heuristics: bool = True, families: Iterable[str] | None = None
+) -> tuple[list[tuple[int, int, str, tuple[int, ...]]], list[tuple[int, int, tuple]]]:
+    """(the findings of BOTH views in SOURCE positions, the segments for `path_at_source`).
+
+    Each finding is (first, last, TYPE, raw), where `raw` is every source position the value
+    occupies — the runs of one block may hold it in several pieces. The same value found by both
+    views — the common case — is ONE finding: the positions are claimed in source coordinates,
+    exactly the way `detect` claims them in the text, and the second view's copy finds them
+    taken. What the second view adds is the shapes only one view can see (mid-word split:
+    reader's view only; token split with no space: flat only) — the two shapes that made a
+    delivered file keep the client in clear while the run reported success.
+    """
+    candidates: list[tuple[int, int, str, tuple[int, ...]]] = []
+    segments: list[tuple[int, int, tuple]] = []
+    for visible, offsets, view_segments in _views_of(xml, part):
+        segments = view_segments  # both views' agree for `path_at_source`: same source boundaries
+        for start, end, ptype in detect(visible, entities, include_heuristics, families):
+            raw = tuple(position for position in offsets[start:end] if position >= 0)
+            if raw:
+                candidates.append((raw[0], raw[-1], ptype, raw))
+    selected: list[tuple[int, int, str, tuple[int, ...]]] = []
+    claimed = bytearray(len(xml))
+    for first, last, ptype, raw in sorted(
+        candidates, key=lambda item: (item[0], -(item[1] - item[0]), item[2])
+    ):
+        # longest first among the same start, as `detect` does; the reader's view runs first,
+        # so on a tie the rendering the operator actually reads wins
+        if any(claimed[position] for position in raw):
+            continue
+        for position in raw:
+            claimed[position] = 1
+        selected.append((first, last, ptype, raw))
+    return selected, segments
+
+
+def _container_leftovers(path: Path, entities, include_heuristics, families) -> int:
+    """How much still looks sensitive in the file we just wrote.
+
+    The verdict comes from the OUTPUT, never from our intent: a `*.redacted.docx` that still
+    carries a client name is the one outcome this feature must never produce. It looks through
+    BOTH views of every part — the redaction does, so a leftover visible to only one of them
+    would be the one hole this check exists to close.
+    """
+    total = 0
+    with open_container(path) as archive:
+        scanned = 0
+        for info in archive.infolist():
+            scanned = _guard_part(info, scanned)
+            text, _codec = decode_part(archive.read(info))
+            if text is not None:
+                part_findings, _segments = container_findings(
+                    text, info.filename, entities, include_heuristics, families
+                )
+                total += len(part_findings)
+    return total
+
+
+def anonymize_container(
+    src: Path,
+    out: Path | None,
+    entities,
+    include_heuristics: bool = True,
+    families: Iterable[str] | None = None,
+    tag: str | None = None,
+    dry_run: bool = False,
+) -> tuple[dict[str, dict[str, str]], dict[str, int], dict[str, int]]:
+    """Redact a ZIP container PART BY PART, keeping the file type, the layout and the styles.
+
+    This is the opposite trade from converting to Markdown: instead of losing headers, footers,
+    comments and document properties (measured: 6 features of 17), it rewrites them where they
+    live. Returns (entries, counts, {part: values replaced}).
+
+    Raises ValueError — deleting the output first — when the written file still contains a detected
+    value. Nothing is delivered on trust.
+    """
+    parts: dict[str, int] = {}
+    blocks: list[tuple[zipfile.ZipInfo, bytes, str | None, str | None]] = []
+    reserved: set[str] = set()
+    with open_container(src) as archive:
+        total = 0
+        for info in archive.infolist():
+            total = _guard_part(info, total)
+            blob = archive.read(info)
+            text, codec = decode_part(blob)
+            if text is None and is_text_part(info.filename):
+                raise UnreadablePart(
+                    f"REFUSED — part {info.filename} is named as text but is not decodable: it "
+                    "cannot be scanned, so a value inside it could not be found. Nothing was written."
+                )
+            if text is not None:
+                # Reserved tokens must be collected across the WHOLE container before allocating:
+                # a part read later could otherwise reuse a number an earlier part already shows.
+                reserved.update(m.group(0) for m in PLACEHOLDER_RE.finditer(visible_text(text)))
+            blocks.append((info, blob, text, codec))
+
+    alloc = _Placeholders(tag, reserved)
+    chunks: list[tuple[zipfile.ZipInfo, bytes]] = []
+    for info, blob, text, codec in blocks:
+        if text is not None:
+            findings, segments = container_findings(
+                text, info.filename, entities, include_heuristics, families
+            )
+            if findings:
+                edits: list[tuple[int, int, str]] = []
+                for _first, _last, ptype, raw in findings:
+                    # The value was fixed BEFORE the claim, in the view it was found in: `for_value`
+                    # keys the map on the real text, never on a view — a split value would
+                    # otherwise be stored with separator spaces in it, and the restore would write
+                    # those spaces into the document. `raw` holds only real source positions.
+                    runs = group_runs(raw)
+                    # EVERY fragment is checked against the first, because the ones in the middle
+                    # are emptied too: checking only the two ends let a value whose middle landed in
+                    # another container (a text box, a second equation) pass and be deleted.
+                    crossed = []
+                    for run in runs[1:]:
+                        # `raw` and `runs` hold SOURCE offsets, so the lookup is by source: mixing
+                        # the two coordinate systems silently returned the first segment's path.
+                        crossed += boundary_offenders(path_at_source(segments, runs[0][0]),
+                                                      path_at_source(segments, run[0]))
+                    crossed = sorted(set(crossed))
+                    if crossed:
+                        raise UnreadablePart(
+                            f"REFUSED — a value of type {ptype} spans a structural boundary "
+                            f"({', '.join(crossed)}) in {info.filename}: rewriting it would take "
+                            "text from another container. Nothing was written."
+                        )
+                    placeholder = alloc.for_value(ptype, "".join(text[position] for position in raw))
+                    # As in the reverse direction: the first fragment carries the whole token and
+                    # the others are emptied, so no formatting moves and the part stays valid.
+                    edits.append((runs[0][0], runs[0][-1] + 1, placeholder))
+                    for run in runs[1:]:
+                        edits.append((run[0], run[-1] + 1, ""))
+                for start, end, replacement in sorted(edits, reverse=True):
+                    text = text[:start] + replacement + text[end:]
+                parts[info.filename] = len(findings)
+                blob = text.encode(codec or "utf-8", "surrogateescape")
+        chunks.append((info, blob))
+
+    entries, counts = alloc.entries, alloc.counts()
+    if dry_run or out is None:
+        return entries, counts, parts
+
+    write_container_atomic(out, chunks)
+    leftover = _container_leftovers(out, entities, include_heuristics, families)
+    if leftover:
+        out.unlink(missing_ok=True)
+        raise ValueError(
+            f"redaction INCOMPLETE: {leftover} value(s) still readable in the written document — "
+            "nothing was written. Report this: the container has a shape this pass does not cover."
+        )
+    return entries, counts, parts
+
+
+TAG_DIGITS = 6  # a width, NOT a guarantee: uniqueness comes from new_tag(existing_tags(...))
+
+
+def new_tag(taken: Iterable[str] = ()) -> str:
+    """A short, per-map identifier carried inside every placeholder.
+
+    `taken` is the set of tags already in use (see `existing_tags`). Uniqueness is CHECKED against
+    the maps that exist, not argued from the birthday bound: with 6 hex (16.7M values) the chance of
+    a collision is ~3% at 1 000 maps and ~53% at 5 000 (`scripts/tag-collision.py` measures the
+    curve), which a tool used daily reaches in a few years — and a collision is exactly the failure
+    the tag exists to prevent, because a wrong map would then resolve the placeholders silently.
+
+    The check is per-directory and NOT atomic: two runs that allocate at the same instant, against
+    the same directory, can still draw the same tag (a declared residual race, ~1/16.7M per pair).
+    Raises RuntimeError only if 128 candidates are all taken, which needs a directory holding a
+    large fraction of both 16^6 and 16^8 values — unreachable in practice.
+    """
+    blocked = set(taken)
+    for digits in (TAG_DIGITS, 8):
+        # 8 is the widest the placeholder syntax accepts (`PLACEHOLDER_RE`: 4-8 hex digits), so the
+        # fallback widens within what every reader already understands.
+        for _ in range(64):
+            candidate = os.urandom(4).hex()[:digits]
+            if candidate not in blocked:
+                return candidate
+    raise RuntimeError("could not allocate a free placeholder tag")
+
+
+def existing_tags(maps_dir: Path) -> set[str]:
+    """Tags already used by the maps in `maps_dir`; unreadable ones are skipped.
+
+    One pass over the given directory per anonymize run — a few hundred files in normal use (a
+    measured 0.17 ms per map), which is the price of checking uniqueness instead of hoping for it.
+    Callers that may write OUTSIDE `DEFAULT_MAPS` must pass the union of both directories, or the
+    guarantee is only as wide as the scan.
+    """
+    tags: set[str] = set()
+    try:
+        paths = sorted(maps_dir.glob("*.map.json"))
+    except OSError:
+        return tags
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("tag"), str):
+            tags.add(payload["tag"])
+    return tags
+
+
+def allocate_tag(destinations: Iterable[Path], pinned: str | None = None) -> str:
+    """A tag no map in ANY of `destinations` uses. A `pinned` tag wins, unchecked.
+
+    Every directory that could hold a map the next restore might confuse must be passed in: the
+    caller that may write outside `DEFAULT_MAPS` (via `--map`) passes both, because a guarantee is
+    only as wide as the scan behind it.
+    """
+    if pinned:
+        return pinned
+    taken: set[str] = set()
+    for directory in dict.fromkeys(destinations):  # the same directory twice = one scan
+        taken |= existing_tags(directory)
+    return new_tag(taken)
+
+
+def tag_of(entries: dict[str, dict[str, str]]) -> str | None:
+    """Recover the tag from the placeholder keys (the map writer needs it)."""
+    for placeholder in entries:
+        match = PLACEHOLDER_RE.fullmatch(placeholder)
+        if match and placeholder.count("-") >= 2:
+            return placeholder.rsplit("-", 1)[-1].rstrip("]")
+    return None
+
+
+# --------------------------------------------------------------- containers
+# Office containers (.docx/.xlsx/.pptx/.odt) are ZIPs whose text lives in XML parts, and a word
+# processor splits a string across runs (`<w:t>[EMAIL-</w:t></w:r><w:r><w:t>1]</w:t>`). Both
+# directions of the tool — writing a placeholder in, restoring a value out — need the same three
+# primitives, so they live here and `deanon.py` imports them: two copies of "what a text part is"
+# would drift, and the drift would be invisible until a document was wrong.
+XML_SUFFIXES = (".xml", ".rels")
+
+
+def _tag_end(xml: str, start: int) -> int:
+    """Index just past the `>` that closes a tag opened at `start`, ignoring `>` inside a quoted
+    attribute value — `<w:t x="a&gt;b">` is one tag, not two (writing the literal `>` here).
+    `-1` when there is no closing `>`, including one swallowed by an unterminated quote."""
+    index = start
+    quote = ""
+    while index < len(xml):
+        char = xml[index]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == ">":
+            return index + 1
+        index += 1
+    return -1
+
+
+def _declaration_end(xml: str, start: int) -> int:
+    """Index just past the `>` that closes a `<!DOCTYPE`/`<!ENTITY`, honouring an internal subset
+    (`[ ... ]`), which may itself contain `>`; `-1` when there is no such `>`."""
+    index = start
+    quote = ""
+    depth = 0
+    while index < len(xml):
+        char = xml[index]
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+        elif char == ">" and depth == 0:
+            return index + 1
+        index += 1
+    return -1
+
+
+def markup_spans(xml: str):
+    """(start, end) of every MARKUP span: a tag, a comment, a PI, a declaration, a CDATA delimiter.
+
+    This replaced `MARKUP_RE = re.compile(r"<[^>]*>")`, which was wrong in three ways, each of them
+    moving a text boundary — and a boundary that disagrees with the file is how a value ends up in
+    the gap nothing looks at (the redaction and the verification share this view, so both miss it):
+      * a `>` inside a QUOTED ATTRIBUTE VALUE ended the tag early (legal XML);
+      * a comment or a CDATA section containing `>` leaked its tail into the visible text;
+      * a CDATA body is character data, i.e. TEXT — the old regex dropped part of it as markup.
+    The CDATA body is therefore left as text (only its two delimiters are markup); the body of a
+    comment is not, because a reader never sees it.
+
+    A construct with NO terminator is not markup either: a `<` that never closes is ordinary text,
+    and letting the span run to the end of the part would take that text out of the redaction AND
+    out of the verification at the same time — the same blind spot on both sides, which is the one
+    failure this file refuses. Hiding less is the safe direction; the old regex, requiring a `>`,
+    happened to do the same.
+    """
+    index = 0
+    length = len(xml)
+    while index < length:
+        start = xml.find("<", index)
+        if start == -1:
+            return
+        if xml.startswith("<!--", start):
+            close = xml.find("-->", start + 4)
+            end = -1 if close == -1 else close + 3
+        elif xml.startswith("<![CDATA[", start):
+            yield (start, start + 9)
+            close = xml.find("]]>", start + 9)
+            if close == -1:
+                return
+            yield (close, close + 3)
+            index = close + 3
+            continue
+        elif xml.startswith("<?", start):
+            close = xml.find("?>", start + 2)
+            end = -1 if close == -1 else close + 2
+        elif xml.startswith("<!", start):
+            end = _declaration_end(xml, start + 2)
+        else:
+            end = _tag_end(xml, start + 1)
+        if end == -1:
+            # The `<` is text: scan from just after it, so the value it was hiding is seen.
+            index = start + 1
+            continue
+        yield (start, end)
+        index = end
+
+# A ZIP part can legally be UTF-16/UTF-32 encoded (OOXML allows it); decoded as UTF-8 its
+# placeholders are NUL-interleaved and would be neither replaced nor detected.
+CONTAINER_BOMS = (
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+)
+
+
+def visible_text(xml: str) -> str:
+    """The text a reader of the document would see: everything that is not markup."""
+    parts: list[str] = []
+    position = 0
+    for start, end in markup_spans(xml):
+        parts.append(xml[position:start])
+        position = end
+    parts.append(xml[position:])
+    return "".join(parts)
+
+
+def decode_part(blob: bytes) -> tuple[str | None, str | None]:
+    """(text, codec) for a text part, or (None, None) when the part is binary.
+
+    Binary is decided by content, not by filename: `word/embeddings/note.txt` holds text that
+    must be rewritten, and an image is binary whatever it is called.
+    """
+    for bom, codec in CONTAINER_BOMS:
+        if blob.startswith(bom):
+            return blob.decode(codec, "surrogateescape"), codec
+    if b"\x00" in blob[:8192]:
+        # A NUL is not proof of binary. Deciding "binary" from it means a text part WITHOUT a BOM
+        # is never scanned AND never verified — both sides use the same mistaken view, so the
+        # check reports zero leftovers while the value sits there. The byte pattern is the
+        # evidence: in UTF-16 every second byte is 0 in the ASCII range, in UTF-32 three of four.
+        wide = _guess_wide_codec(blob)
+        if wide is None:
+            return None, None
+        return blob.decode(wide), wide
+    return blob.decode("utf-8", "surrogateescape"), "utf-8"
+
+
+def _guess_wide_codec(blob: bytes) -> str | None:
+    """The UTF-16/32 variant a BOM-less blob looks like, or None if it does not look like one.
+
+    Ratios rather than all-or-nothing (a CJK document has non-zero high bytes), and a STRICT
+    decode: a part we cannot decode cleanly must not be rewritten through lossy replacement —
+    it is refused instead, which is the fail-closed direction.
+    """
+    sample = blob[:4096]
+    if len(sample) < 16:
+        return None
+    for codec, stride, zero_slots in (
+        ("utf-16-le", 2, (1,)), ("utf-16-be", 2, (0,)),
+        ("utf-32-le", 4, (1, 2, 3)), ("utf-32-be", 4, (0, 1, 2)),
+    ):
+        slots = [byte for index, byte in enumerate(sample) if index % stride in zero_slots]
+        others = [byte for index, byte in enumerate(sample) if index % stride not in zero_slots]
+        if not slots or not others:
+            continue
+        if sum(1 for byte in slots if byte == 0) / len(slots) < 0.9:
+            continue
+        if sum(1 for byte in others if byte != 0) / len(others) < 0.8:
+            continue
+        try:
+            text = blob.decode(codec)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if "\x00" in text:
+            continue
+        return codec
+    return None
+
+
+def is_xml_part(name: str) -> bool:
+    return name == "[Content_Types].xml" or name.lower().endswith(XML_SUFFIXES)
+
+
+# Extensions that are TEXT by definition, whatever the bytes say. A part whose name promises text but
+# cannot be decoded is refused rather than passed through: skipping it would deliver a document with a
+# value still inside, and the verification would not see it either (same view, same blind spot). The
+# list is deliberately about NAMES, because content alone cannot distinguish a text part in an
+# encoding we do not know from a genuinely binary object.
+TEXT_SUFFIXES = XML_SUFFIXES + (".vml", ".rdf", ".txt", ".html", ".xhtml", ".svg", ".csv", ".json", ".eml")
+
+
+def is_text_part(name: str) -> bool:
+    return name == "[Content_Types].xml" or name.lower().endswith(TEXT_SUFFIXES)
+
+
+def xml_protect(value: str) -> str:
+    """Escape a value before writing it into an XML part.
+
+    `&`, `<`, `>` are mandatory in element text; `"` and `'` matter when the value sits in an
+    attribute (`w:tooltip="..."`, a `.rels` Target). Escaping quotes in element text is harmless —
+    they decode back to themselves — so this is safe in both contexts.
+    """
+    return _sax_escape(value, {'"': "&quot;", "'": "&apos;"})
+
+
+def _walk_parts(xml: str, separator: str | None):
+    """(visible text, per-character source offsets, one (visible start, source start, path) per
+    text segment).
+
+    One implementation for both directions. Three details are about NOT spending the text over again:
+    the visible text is built from chunks and joined ONCE (a list of single characters is a pointer
+    per character), the offsets live in an `array('i')` (a Python list of ints costs tens of bytes
+    each, which is how a 64 MB part used to ask for gigabytes), and the container paths are one small
+    tuple per TEXT SEGMENT rather than per character. `-1` marks a character that has no source
+    position because it IS the separator standing for a tag.
+
+    Element ids, not just names, are what make the paths comparable: two runs of the same paragraph
+    have the same path, two paragraphs do not.
+
+    `separator=None` builds the view a READER of the document sees: the fragments of ONE block join
+    with NOTHING, because that is how the document renders them. Word's edit history splits a word
+    across runs (`BeS`|`afe` is `BeSafe` on screen — rsid fragmentation), and the flat
+    one-space-per-tag view could not find it: the redaction reported success while the company
+    stayed in clear in the delivered file, and the leftover check — same view — agreed. A NEW
+    block, and a tag that itself renders whitespace (WHITESPACE_TAGS), contributes one space, so
+    no two values of the document can ever merge into a word that is not in it.
+    """
+    chunks: list[str] = []
+    offsets = array.array("i")
+    stack: list[tuple[str, int]] = []
+    segments: list[tuple[int, int, tuple]] = []
+    opened = 0
+    position = 0
+    length = 0
+    flow = separator is None
+    last_block: tuple = ()  # the containers of the last text the reader saw (empty = none yet)
+    for start, end in markup_spans(xml):
+        chunk = xml[position:start]
+        segments.append((length, position, tuple(stack)))
+        if flow:
+            if chunk:
+                block = container_signature(tuple(stack))
+                if last_block and block != last_block:
+                    chunks.append(" ")  # a new block began: the reader sees a break here
+                    offsets.append(-1)
+                    length += 1
+                last_block = block
+            chunks.append(chunk)
+            offsets.extend(range(position, start))
+            length += len(chunk)
+        else:
+            chunks.append(chunk)
+            offsets.extend(range(position, start))
+            length += len(chunk)
+            if separator:
+                chunks.append(separator)
+                offsets.append(-1)
+                length += 1
+        parsed = _element_name(xml[start:end])
+        if parsed is not None:
+            name, closing, self_closing = parsed
+            if flow and self_closing and name in WHITESPACE_TAGS:
+                chunks.append(" ")  # the tag itself renders whitespace: tab, break, spaces
+                offsets.append(-1)
+                length += 1
+            if closing:
+                if any(open_name == name for open_name, _id in stack):
+                    while stack and stack[-1][0] != name:
+                        stack.pop()
+                    stack.pop()
+            elif not self_closing:
+                opened += 1
+                stack.append((name, opened))
+        position = end
+    chunk = xml[position:]
+    segments.append((length, position, tuple(stack)))
+    chunks.append(chunk)
+    offsets.extend(range(position, len(xml)))
+    return "".join(chunks), offsets, segments
+
+
+def visible_index(xml: str) -> tuple[str, array.array]:
+    """(the text a reader sees, the offset in `xml` of every one of its characters).
+
+    This is what makes a value (or a placeholder) that a word processor split across runs findable
+    as one string, and repairable without touching a single tag.
+    """
+    visible, offsets, _segments = _walk_parts(xml, "")
+    return visible, offsets
+
+
+def write_container_atomic(output: Path, chunks) -> None:
+    """Write the parts to a new ZIP, then `os.replace` it into place: a half-written container
+    must never be left where a caller could pick it up."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.tmp-{os.urandom(4).hex()}")
+    try:
+        with zipfile.ZipFile(temporary, "w") as target:
+            for info, blob in chunks:
+                # A fresh ZipInfo: reusing the original object can carry a data-descriptor flag
+                # bit that zipfile then rewrites inconsistently.
+                clean = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                clean.compress_type = info.compress_type
+                clean.external_attr = info.external_attr
+                clean.internal_attr = info.internal_attr
+                clean.create_system = info.create_system
+                target.writestr(clean, blob)
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _default_output(path: Path) -> Path:
+    return path.with_name(f"{path.stem}.redacted{path.suffix}")
+
+
+def _write_private(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as stream:
+        stream.write(data)
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def read_text(path: Path) -> str:
+    # Keep original line endings so the map can restore a text file byte-for-byte.
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as stream:
+        return stream.read()
+
+
+def _fold_entity(value: str) -> str:
+    """Canonical key for fuzzy comparison: case-folded, legal forms dropped, non-alphanumerics
+    removed. `Contoso S.r.l.` and `CONTOSO` fold to the same key."""
+    tokens = _name_tokens(value)
+    return "".join(char for char in "".join(tokens).casefold() if char.isalnum())
+
+
+NEAR_MISS_WORD_LIMIT = 400
+NEAR_MISS_VOCAB_LIMIT = 200
+
+# The default scan limit is 12 MB. `--batch` and `--check` on a container both
+# derive from it — a folder, and a ZIP whose parts expand, are not licences to exceed it silently.
+SCAN_MAX_BYTES = 12 * 1024 * 1024
+BATCH_MAX_BYTES = SCAN_MAX_BYTES
+# Our own outputs must never be treated as input: re-anonymizing `x.redacted.md` would nest
+# placeholders and re-number them, and deleting nothing is not the fix.
+OWN_OUTPUT_SUFFIXES = (".redacted", ".deanon")
+# Anchored to the FINAL extension and case-insensitive: a bare substring test skipped real sources
+# (`note.redacted.draft.txt`) and missed `X.REDACTED.MD`.
+OWN_OUTPUT_RE = re.compile(r"\.(?:redacted|deanon)\.[^.]*$", re.IGNORECASE)
+NEAR_MISS_CUTOFF = 0.86
+WORD_RE = re.compile(r"[^\W\d_][\w'’\-]*", re.UNICODE)
+
+
+def near_misses(
+    text: str, entities: list[Entity], found: list[tuple[int, int, str]]
+) -> tuple[list[dict[str, object]], bool]:
+    """Dictionary entries that the text almost contains.
+
+    Two kinds, both REPORTED for a human to declare — never used to redact, because a fuzzy rule
+    that silently misses is worse than an explicit alias added once:
+      * `variant` — the text writes the entity differently but it folds to the same key
+        (`Con Toso` / `CONTOSO Srl` vs a declared `Contoso`); found by folding adjacent-word joins.
+      * `near` — a single word that is close but not identical (a typo, another transliteration).
+    Bounded on purpose (word and vocabulary caps) so the audit stays fast.
+    """
+    import difflib
+
+    covered = bytearray(len(text))
+    for start, end, _type in found:
+        covered[start:end] = b"\x01" * (end - start)
+
+    vocabulary: dict[str, Entity] = {}
+    for entity in entities:
+        key = _fold_entity(entity.surface)
+        if len(key) >= 5:
+            vocabulary.setdefault(key, entity)
+    if not vocabulary:
+        return [], False
+
+    words: list[tuple[int, int, str]] = []
+    for match in WORD_RE.finditer(text):
+        if any(covered[match.start():match.end()]):
+            continue
+        words.append((match.start(), match.end(), match.group(0)))
+        if len(words) >= NEAR_MISS_WORD_LIMIT:
+            break
+    if not words:
+        return [], False
+
+    hits: dict[str, tuple[str, int, str, Entity, float]] = {}
+    # 1) joins of adjacent words on the same line: `Be` + `Safe` -> `contoso`
+    for index in range(len(words)):
+        for size in (2, 3):
+            chunk = words[index:index + size]
+            if len(chunk) < size:
+                continue
+            if any("\n" in text[chunk[k][1]:chunk[k + 1][0]] for k in range(len(chunk) - 1)):
+                continue
+            joined = "".join(word for _p, _e, word in chunk)
+            key = _fold_entity(joined)
+            entity = vocabulary.get(key)
+            if entity is not None and key not in hits:
+                hits[key] = ("variant", chunk[0][0], text[chunk[0][0]:chunk[-1][1]], entity, 1.0)
+    # 2) single words: exact folding or a close match
+    keys = list(vocabulary)[:NEAR_MISS_VOCAB_LIMIT]
+    for position, _end, word in words:
+        if len(word) < 5:
+            continue
+        key = _fold_entity(word)
+        if key in hits:
+            continue
+        entity = vocabulary.get(key)
+        if entity is not None:
+            hits[key] = ("variant", position, word, entity, 1.0)
+            continue
+        close = difflib.get_close_matches(key, keys, n=1, cutoff=NEAR_MISS_CUTOFF)
+        if close:
+            hits[key] = (
+                "near",
+                position,
+                word,
+                vocabulary[close[0]],
+                round(difflib.SequenceMatcher(None, key, close[0]).ratio(), 3),
+            )
+
+    out: list[dict[str, object]] = []
+    for kind, position, label, entity, similarity in hits.values():
+        out.append({
+            "kind": kind,
+            "type": entity.type,
+            "line": text.count("\n", 0, position) + 1,
+            "similarity": similarity,
+            "token_masked": label[:1] + "\u2022" * (len(label) - 1),
+            # Filled only with --reveal: the default report must be safe to hand to an agent.
+            "token": label,
+            "entity": entity.surface,
+        })
+    out.sort(key=lambda item: (-float(item["similarity"]), str(item["token_masked"])))
+    return out, len(words) >= NEAR_MISS_WORD_LIMIT or len(vocabulary) > NEAR_MISS_VOCAB_LIMIT
+
+
+def _dictionary_paths(args: argparse.Namespace) -> list[Path]:
+    """The custom dictionary files to load, before any catalog.
+
+    `--entities` is repeatable. When it is given, every path must exist (a typo must fail loudly,
+    not silently drop a dictionary). When it is not, the default dictionaries that exist are used:
+    `entities.txt` (generic), `people.txt` (people), `clients.txt` (companies), and the
+    optional `phone_numbers.txt`, `emails.txt`, and `addresses.txt`.
+    """
+    requested = getattr(args, "entities", None)
+    if requested:
+        paths = [Path(item).expanduser() for item in _as_list(requested)]
+        if not paths:
+            raise ValueError("--entities needs a path")
+        missing = [str(path) for path in paths if not path.is_file()]
+        if missing:
+            raise ValueError("dictionary file not found: " + ", ".join(missing))
+        return paths
+    paths = [path for path in DEFAULT_DICTIONARIES if path.is_file()]
+    if not paths:
+        # NOT fatal. A fresh install has no curated dictionary, and the engine must keep working
+        # with the pattern rules alone. A hard error here would make `--check --json` print
+        # nothing, and a downstream check distinguishes missing configuration from malformed engine output.
+        print(
+            "anon: no dictionary file found; using the built-in patterns only (expected one of "
+            + ", ".join(str(path) for path in DEFAULT_DICTIONARIES)
+            + ")",
+            file=sys.stderr,
+        )
+    return paths
+
+
+def resolve_entities(args: argparse.Namespace) -> list[Entity]:
+    """The custom dictionaries plus the selected catalogs, as one list."""
+    paths = _dictionary_paths(args)
+    for name in _as_list(getattr(args, "catalogs", None)):
+        if True:
+            path = catalog_path(name)
+            if not path.is_file():
+                available = ", ".join(item["name"] for item in list_catalogs()) or "(none installed)"
+                raise ValueError(f"unknown catalog '{name}' — available: {available}")
+            paths.append(path)
+    return load_entities_many(paths)
+
+
+def resolve_families(args: argparse.Namespace) -> set[str] | None:
+    """`--patterns identity,network` restricts the built-in pattern groups (default: all)."""
+    requested = _as_list(getattr(args, "patterns", None))
+    if not requested:
+        return None
+    families = {item.lower() for item in requested}
+    unknown = families - set(PATTERN_FAMILIES)
+    if unknown:
+        raise ValueError(
+            f"unknown pattern group(s): {', '.join(sorted(unknown))} — "
+            f"available: {', '.join(PATTERN_FAMILIES)}"
+        )
+    return families
+
+
+# A .docx/.xlsx/.pptx/.odt is a ZIP; .doc/.xls a CFB; a PDF starts with %PDF-. Reading any of
+# them as text produces mojibake: the regexes match a few lucky byte runs, almost nothing real
+# is redacted, and the "redacted" copy is a corrupted file that LOOKS anonymized. That silent
+# half-success is the most dangerous possible output for a privacy tool, so binary input is
+# refused instead.
+#
+# The same sniff is what `--check` uses to protect `read` (see `cmd_check`): the document reader
+# sends images as attachments but decodes EVERYTHING else with `toString("utf-8")`
+# (dist/core/tools/read.js) — so a .docx with stored entries, a legacy UTF-16 .doc or an
+# uncompressed PDF stream would hand readable names to the model. Unscannable documents must
+# therefore fail CLOSED, not "not sensitive".
+CONTAINER_PREFIX_MAGIC = (
+    b"PK\x03\x04",  # zip: docx, xlsx, pptx, odt, ods, odp, epub, jar...
+    b"PK\x05\x06",
+    b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",  # CFB: legacy .doc, .xls, .ppt, .msg
+    b"\x1f\x8b",  # gzip
+    b"Rar!",
+    b"7z\xbc\xaf\x27\x1c",
+    b"OggS",
+    b"MZ",  # PE executable
+    b"\x7fELF",
+)
+# Searched (not anchored): the PDF spec allows up to 1024 bytes before `%PDF-`, and a zip may
+# have been appended after a preamble. These signatures contain control bytes, so text cannot
+# contain them by accident.
+CONTAINER_SEARCH_MAGIC = (b"PK\x03\x04", b"PK\x07\x08")
+# `%PDF-` is printable ASCII, so searching for it bare would refuse any document or log that
+# merely MENTIONS it. A real header carries a version (`%PDF-1.7`).
+PDF_HEADER_RE = re.compile(rb"%PDF-\d\.\d")
+IMAGE_PREFIX_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
+
+
+def _is_image(head: bytes) -> bool:
+    if head.startswith(IMAGE_PREFIX_MAGIC):
+        return True
+    if head.startswith(b"RIFF"):
+        return head[8:12] == b"WEBP"
+    # BMP: "BM" alone would match any text starting with those letters, so require the
+    # reserved field to be zero (bytes 6-9) as the format mandates.
+    return head.startswith(b"BM") and head[6:10] == b"\x00\x00\x00\x00"
+
+
+def sniff(path: Path, head_bytes: int = 8192) -> str | None:
+    """Classify the input: 'image', 'container', 'binary', or None for scannable text."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(head_bytes)
+    except OSError:
+        return None
+    if _is_image(head):
+        return "image"
+    if head.startswith(CONTAINER_PREFIX_MAGIC):
+        return "container"
+    # The PDF header may start at offset <=1024 and the signature itself is 8 bytes.
+    window = head[:1032]
+    if any(magic in window for magic in CONTAINER_SEARCH_MAGIC):
+        return "container"
+    if PDF_HEADER_RE.search(window):
+        return "container"
+    if b"\x00" in head:
+        return "binary"
+    return None
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    if args.file == "-":
+        # stdin mode: check arbitrary text (e.g. the Markdown anon-guard just produced)
+        # without writing a temp file that would hold the very data being inspected.
+        entities = resolve_entities(args)
+        text = sys.stdin.read()
+        return _emit_check(args, detect(text, entities, families=resolve_families(args)), Path("<stdin>"), text=text)
+    target = Path(args.file).expanduser()
+    allow = load_allowlist(Path(args.allow) if args.allow else DEFAULT_ALLOW)
+    allow += list(args.allow_glob or [])
+    if is_allowed(target, allow):
+        return _emit_check(args, [], target, allowed=True)
+    if not target.is_file():
+        if args.json:
+            print(json.dumps({"sensitive": False, "error": f"not a file: {target}"}))
+        else:
+            print(f"anon: not a file: {target}", file=sys.stderr)
+        return 0
+    entities = resolve_entities(args)
+    kind = sniff(target)
+    if kind == "image":
+        # Not scannable (it is sent as an image attachment, not as text), but reading an image
+        # is a legitimate feature. Declared gap: a screenshot of a client document leaks.
+        return _emit_check(args, [], target, binary=True)
+    if kind is not None:
+        # A container's parts ARE scannable, and now that we rewrite them in place we must be able
+        # to name what would come out. `unscannable` stays, and not as a formality: it describes
+        # what the `read` tool does with this file (decode it as text, which this is not), and the
+        # guard's auto-remediation keys on that exact field.
+        inside = ""
+        found_inside: list[tuple[int, int, str]] = []
+        if kind == "container":
+            try:
+                inside, found_inside = audit_container(
+                    target, entities, families=resolve_families(args), max_total=SCAN_MAX_BYTES
+                )
+            except (UnreadableContainer, OSError, zipfile.BadZipFile):
+                # A PDF, or a package we cannot open: the honest answer stays "unscannable".
+                found_inside = []
+        return _emit_check(args, found_inside, target, text=inside, binary=True, unscannable=True,
+                           container=kind == "container")
+    text = read_text(target)
+    found = detect(text, entities, families=resolve_families(args))
+    return _emit_check(args, found, target, text=text)
+
+
+def read_json_object(text: str, what: str) -> dict:
+    """Parse `text` as a JSON object, turning EVERY malformed-input failure into ValueError.
+
+    `json.loads` raises `RecursionError` on deeply nested input — not a ValueError — so a caller
+    that only catches ValueError turns a malformed file or request body into a 500 or an
+    unhandled traceback instead of a clean refusal. Both `deanon` (map files) and the web API
+    (request bodies) go through here, so the two cannot drift apart again.
+    """
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError(f"{what}: malformed JSON ({type(exc).__name__})") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{what}: expected a JSON object, found {type(data).__name__}")
+    return data
+
+
+def _envelope(tool: str) -> dict[str, object]:
+    return {"schema": SCHEMA, "tool": tool, "version": VERSION}
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Is this file REALLY anonymized? Report residual risk, without echoings any value."""
+    target = Path(args.file).expanduser()
+    if not target.is_file():
+        print(f"anon: not a file: {target}", file=sys.stderr)
+        return 2
+    kind = sniff(target)
+    entities = resolve_entities(args)
+    families = resolve_families(args)
+    inside_container = False
+    found: list[tuple[int, int, str]] = []
+    if kind == "container":
+        # A container is auditable now that its parts are scanned elsewhere — through the SAME
+        # two views the rewrite detects on, so "clean" here means the same thing it means there:
+        # an audit weaker than the rewrite would call 'already anonymized' a file the redaction
+        # itself would still redact. A PDF or a legacy .doc still cannot be checked without
+        # rewriting it, and saying so is the honest answer.
+        try:
+            text, found = audit_container(
+                target, entities, families=families, max_total=SCAN_MAX_BYTES
+            )
+            inside_container = True
+        except (UnreadableContainer, OSError, zipfile.BadZipFile):
+            print(
+                f"anon: {target.name} is binary, or a container that cannot be read as a package "
+                "— convert it to Markdown first",
+                file=sys.stderr,
+            )
+            return 2
+    elif kind is not None:
+        print(f"anon: {target.name} is binary — convert it to Markdown first", file=sys.stderr)
+        return 2
+    else:
+        text = read_text(target)
+        found = detect(text, entities, families=families)
+    candidates, capped = near_misses(text, entities, found)
+    placeholders = sum(1 for match in PLACEHOLDER_RE.finditer(text))
+
+    by_type: dict[str, int] = {}
+    findings: list[dict[str, object]] = []
+    for start, _end, ptype in found:
+        by_type[ptype] = by_type.get(ptype, 0) + 1
+        if len(findings) < 50:
+            findings.append({"type": ptype, "line": text.count("\n", 0, start) + 1})
+
+    verdict = "sensitive" if found else ("suspicious" if candidates else "clean")
+    report: dict[str, object] = {
+        **_envelope("anon.py audit"),
+        **({"container": True} if inside_container else {}),
+        "file": str(target),
+        "verdict": verdict,
+        "total": len(found),
+        "types": by_type,
+        "findings": findings,
+        "near_miss": candidates if args.reveal else [
+            {k: v for k, v in item.items() if k not in ("token", "entity")} for item in candidates
+        ],
+        "revealed": bool(args.reveal),
+        "candidates_capped": capped,
+        "placeholders_present": placeholders,
+    }
+    if len(found) > len(findings):
+        report["findings_truncated"] = True
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+    elif not args.quiet or args.reveal:
+        if found:
+            summary = ", ".join(f"{k}x{v}" for k, v in sorted(by_type.items()))
+            lines = ", ".join(f"line {item['line']}" for item in findings[:8])
+            print(f"anon: SENSITIVE content found ({summary}) at {lines}")
+        if candidates:
+            print(f"anon: {len(candidates)} candidate(s) — a declared entity written differently"
+                  f"{'' if args.reveal else ' (masked; use --reveal to see them, they ARE the sensitive data)'}")
+            for item in candidates:
+                label = f"{item['token']!r} ~ {item['entity']!r}" if args.reveal else str(item["token_masked"])
+                print(f"        line {item['line']} [{item['kind']}]: {label} ({item['type']}, {item['similarity']})")
+        if placeholders:
+            print(f"anon: {placeholders} placeholder(s) present — consistent with an already-redacted document")
+        if not found and not candidates:
+            print(f"anon: CLEAN — no sensitive content, no near miss ({entity_count(entities)} rules applied)")
+        print(f"anon: verdict: {verdict}")
+
+    if found:
+        return 1
+    return 4 if candidates else 0
+
+
+def _emit_check(
+    args: argparse.Namespace,
+    found: list[tuple[int, int, str]],
+    target: Path,
+    text: str = "",
+    allowed: bool = False,
+    binary: bool = False,
+    unscannable: bool = False,
+    container: bool = False,
+) -> int:
+    by_type: dict[str, int] = {}
+    findings: list[dict[str, object]] = []
+    for start, _end, ptype in found:
+        by_type[ptype] = by_type.get(ptype, 0) + 1
+        if len(findings) < 20:
+            findings.append({"type": ptype, "line": text.count("\n", 0, start) + 1})
+    result: dict[str, object] = {
+        **_envelope("anon.py --check"),
+        "sensitive": bool(found) or unscannable,
+        "file": str(target),
+        "total": len(found),
+        "types": by_type,
+        "findings": findings,
+    }
+    if len(found) > len(findings):
+        # The list is capped for output size: say so, instead of letting a truncated list read as
+        # the whole picture (the near-miss cap had exactly this failure mode).
+        result["findings_truncated"] = True
+    if allowed:
+        result["allowed"] = True
+    if binary:
+        result["binary"] = True
+    if unscannable:
+        result["unscannable"] = True
+    if container:
+        # The line numbers refer to the parts as a reader would concatenate them, not to a file
+        # with lines: say which of the two views this is, instead of leaving it to be guessed.
+        result["container"] = True
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    elif found:
+        summary = ", ".join(f"{k}x{v}" for k, v in sorted(by_type.items()))
+        lines = ", ".join(f"line {f['line']}" for f in findings[:5])
+        print(f"anon: sensitive content found in {target} ({summary}) at {lines}")
+    elif unscannable:
+        print(f"anon: un-scannable binary document: {target}")
+    return 1 if (found or unscannable) else 0
+
+
+def _refusal_reason(exc: Exception) -> str:
+    """A short, actionable version of a container refusal (the message itself names the part)."""
+    message = str(exc).removeprefix("REFUSED — ").split(":")[0].strip()
+    return f"container refused: {message}" if message else "container refused (binary or corrupt)"
+
+
+def _is_own_output(name: str) -> bool:
+    """True for a file this tool produced: `x.redacted.md`, `X.REDACTED.MD`, `x.deanon.docx`,
+    `x.map.json`.
+
+    Re-anonymizing our own output would re-number and nest the placeholders; a map is never input.
+    """
+    return bool(OWN_OUTPUT_RE.search(name)) or name.lower().endswith(".map.json")
+
+
+def plan_map_path(args: argparse.Namespace) -> Path:
+    """Where the map will go. Planned separately from writing it, so a dry run can name the file it
+    would create without creating anything."""
+    selected = getattr(args, "map", None)
+    if selected:
+        return Path(selected).expanduser()
+    return DEFAULT_MAPS / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}.map.json"
+
+
+def write_map(map_path: Path, src: Path, out: Path | None, entries, counts) -> None:
+    payload = {
+        "tag": tag_of(entries),
+        "version": VERSION,
+        "id": map_path.stem.removesuffix(".map"),
+        "source": str(src.resolve()),
+        "output": str(out) if out is not None else "(stdout)",
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "counts": counts,
+        "entries": entries,
+    }
+    _write_private(map_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def write_run(
+    src: Path,
+    redacted: str,
+    entries: dict[str, dict[str, str]],
+    counts: dict[str, int],
+    tag: str,
+    args: argparse.Namespace,
+    *,
+    dry_run: bool,
+    out_path: Path | None = None,
+) -> tuple[Path | None, Path | None]:
+    """Write the redacted copy and its map; with `dry_run`, compute the paths and write NOTHING.
+
+    One function for both the single-file and the batch path: two copies of "where does the output
+    go, and what does the map contain" is exactly the duplication that drifts.
+    """
+    to_stdout = args.stdout and out_path is None
+    out: Path | None = None
+    if not to_stdout:
+        out = out_path if out_path is not None else (Path(args.out).expanduser() if args.out else _default_output(src))
+    map_path: Path | None = plan_map_path(args) if entries else None
+    if dry_run:
+        return out, map_path
+    if to_stdout:
+        # `--stdout` redirects the TEXT; it does not opt out of writing the map, or the pipeline
+        # that just consumed the redacted text on stdout could never be reversed.
+        sys.stdout.write(redacted)
+        if not redacted.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        _write_private(out, redacted)
+    if map_path is not None:
+        write_map(map_path, src, out, entries, counts)
+    return out, map_path
+
+
+def _emit_dry_run(
+    src: Path,
+    out: Path | None,
+    map_path: Path | None,
+    entries: dict[str, dict[str, str]],
+    counts: dict[str, int],
+    args: argparse.Namespace,
+) -> int:
+    """`--check` answers "is this sensitive?". This answers "what would change, and where would it
+    land?" — the question that comes first, and the only safe first step on a whole folder."""
+    if args.json:
+        print(json.dumps({
+            **_envelope("anon.py --dry-run"),
+            "dry_run": True,
+            "file": str(src),
+            "sensitive": bool(entries),
+            "would_write": str(out) if out else "(stdout)",
+            "would_map": str(map_path) if map_path else None,
+            "entries": len(entries),
+            "counts": counts,
+        }, ensure_ascii=False))
+        return 0
+    if not args.quiet:
+        if entries:
+            summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            print(f"anon: dry run — nothing written; would redact {len(entries)} span(s) [{summary}]")
+            if out is not None:
+                print(f"anon: would write -> {out}")
+            print(f"anon: would map   -> {map_path}")
+        else:
+            print(f"anon: dry run — nothing sensitive in {src}; nothing would be written")
+    return 0
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    """Anonymize a directory, one document at a time, never touching a source in place.
+
+    What it REFUSES is the point: binary/unscannable files are reported and skipped (never copied
+    under a `redacted` name), our own outputs are skipped (re-anonymizing them would nest the
+    placeholders), and anything over `BATCH_MAX_BYTES` is skipped rather than half-processed. With
+    `--dry-run` it reports the same plan and writes nothing; with `--check` it only gives verdicts
+    and exits 1 if any file is sensitive, which is the folder-shaped gate.
+    """
+    root = Path(args.file).expanduser()
+    if not root.is_dir():
+        raise ValueError(f"--batch needs a directory, not {root}")
+    if args.stdout:
+        raise ValueError("--batch writes files: --stdout does not apply")
+    if args.map:
+        raise ValueError("--batch writes one map per document: --map does not apply")
+    resolved = root.resolve()
+    private = ANON_HOME.resolve()
+    if resolved == private or private in resolved.parents:
+        raise ValueError(f"refusing a batch inside the private store ({ANON_HOME})")
+    out_dir = Path(args.out).expanduser() if args.out else None
+    if out_dir is not None:
+        out_resolved = out_dir.resolve()
+        if out_resolved == resolved or out_resolved in resolved.parents:
+            # Otherwise every candidate file looks like "inside the output directory" and the run
+            # reports 0 file(s) / 0 skipped — a no-op that looks like success.
+            raise ValueError("--out must not be the folder being scanned, nor a parent of it")
+        if not (args.dry_run or args.check):
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+    entities = resolve_entities(args)          # resolved once: the folder shares one dictionary
+    families = resolve_families(args)
+    rows: list[dict[str, object]] = []
+    skipped: list[tuple[Path, str]] = []
+    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        # `is_file()` FOLLOWS a symlink, so a link inside the tree can point anywhere: at a file
+        # outside the scan root, or at the private store, whose maps hold the real values. Scanning
+        # it would process — and copy under a `redacted` name — something the operator never put in
+        # scope. The tree is the scope, so a target outside it is skipped and said to be.
+        # A HARD link is the honest limit of this check: it is not dereferenceable, so it resolves
+        # inside the root and is processed. Benign — the output is redacted, and creating one needs
+        # write access to the tree — but the boundary is here, not at "any link".
+        target = path.resolve()
+        if target == private or private in target.parents:
+            skipped.append((path, "symlink into the private store"))
+            continue
+        if resolved not in target.parents and target != resolved:
+            skipped.append((path, "symlink outside the scan root"))
+            continue
+        if out_dir is not None and out_dir.resolve() in target.parents:
+            continue  # never re-scan what we just wrote
+        if _is_own_output(path.name):
+            skipped.append((path, "own output"))
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            skipped.append((path, "unreadable"))
+            continue
+        if size > BATCH_MAX_BYTES:
+            skipped.append((path, f"over {BATCH_MAX_BYTES // (1024 * 1024)} MB"))
+            continue
+        kind = sniff(path)
+        if kind == "container":
+            try:
+                text = container_text(path)
+            except UnreadableContainer as exc:
+                # "binary or corrupt" loses the actionable half: WHICH part, and whether the file is
+                # a bomb, unreadable text, or not a ZIP at all.
+                if args.check:
+                    rows.append({"file": str(path), "total": 1, "entries": 0, "counts": {},
+                                 "redacted": None, "map": None, "unscannable": True})
+                else:
+                    skipped.append((path, _refusal_reason(exc)))
+                continue
+        elif kind is not None:
+            if args.check:
+                # Fail CLOSED, exactly like the single-file check: "unscannable" is not "clean".
+                # Reporting a folder of PDFs as clean is the one answer that must never happen.
+                rows.append({"file": str(path), "total": 1, "entries": 0, "counts": {},
+                             "redacted": None, "map": None, "unscannable": True})
+            else:
+                skipped.append((path, "not text (binary/image: convert it first)"))
+            continue
+        else:
+            text = read_text(path)
+        if args.check:
+            found = detect(text, entities, include_heuristics=not args.no_hosts, families=families)
+            by_type: dict[str, int] = {}
+            for _start, _end, ptype in found:
+                by_type[ptype] = by_type.get(ptype, 0) + 1
+            rows.append({"file": str(path), "total": len(found), "entries": 0, "counts": by_type,
+                         "redacted": None, "map": None})
+            continue
+        tag = new_tag() if args.dry_run else allocate_tag([DEFAULT_MAPS])
+        # The relative path is preserved: flattening to the basename made `a/nota.txt` and
+        # `b/nota.txt` overwrite each other in --out, silently, with two maps pointing at one file.
+        relative = path.relative_to(root)
+        planned = out_dir / relative.parent / _default_output(path).name if out_dir is not None else None
+        if kind == "container":
+            # Kept, not converted: the folder workflow brings documents back, not Markdown.
+            out = planned if planned is not None else _default_output(path)
+            try:
+                entries, counts, _parts = anonymize_container(
+                    path, None if args.dry_run else out, entities,
+                    include_heuristics=not args.no_hosts, families=families, tag=tag, dry_run=args.dry_run,
+                )
+            except UnreadableContainer:
+                if args.check:
+                    rows.append({"file": str(path), "total": 1, "entries": 0, "counts": {},
+                                 "redacted": None, "map": None, "unscannable": True})
+                else:
+                    skipped.append((path, "not a readable container (binary or corrupt)"))
+                continue
+            map_path = plan_map_path(args) if entries else None
+            if not args.dry_run and map_path is not None:
+                write_map(map_path, path, out, entries, counts)
+        else:
+            redacted, entries, counts = anonymize(
+                text, entities, include_heuristics=not args.no_hosts, families=families, tag=tag,
+            )
+            out, map_path = write_run(
+                path, redacted, entries, counts, tag, args, dry_run=args.dry_run, out_path=planned,
+            )
+        rows.append({
+            "file": str(path), "total": len(entries), "entries": len(entries), "counts": counts,
+            "redacted": str(out) if out else None, "map": str(map_path) if map_path else None,
+        })
+
+    placeholders = sum(int(row["entries"]) for row in rows)
+    changed = sum(1 for row in rows if int(row["entries"]))
+    if args.json:
+        print(json.dumps({
+            **_envelope("anon.py --batch"),
+            "batch": True,
+            "dry_run": bool(args.dry_run),
+            "check": bool(args.check),
+            "root": str(root),
+            "files": rows,
+            "skipped": [{"file": str(path), "reason": reason} for path, reason in skipped],
+            "totals": {"scanned": len(rows), "changed": changed, "placeholders": placeholders,
+                       "skipped": len(skipped)},
+        }, ensure_ascii=False))
+    elif not args.quiet:
+        for row in rows:
+            name = Path(str(row["file"])).name
+            summary = ", ".join(f"{k}x{v}" for k, v in sorted(dict(row["counts"]).items()))  # type: ignore[arg-type]
+            if args.check:
+                if row.get("unscannable"):
+                    print(f"SENSITIVE  {name}  (non scansionabile: convertilo prima, la redazione non l'ha visto)")
+                else:
+                    print(f"{'SENSITIVE' if row['total'] else 'clean    '}  {name}" + (f"  {summary}" if summary else ""))
+            elif row["redacted"]:
+                verb = "would write" if args.dry_run else "->"
+                print(f"  {name}  [{summary}]  {verb} {Path(str(row['redacted'])).name}")
+            else:
+                print(f"  {name}  clean")
+        for path, reason in skipped:
+            print(f"  skipped  {path.name}  ({reason})")
+        verb = "would redact" if args.dry_run else "redacted"
+        print(
+            f"anon: {len(rows)} file(s), {changed} {verb}, {placeholders} placeholder(s), "
+            f"{len(skipped)} skipped"
+        )
+    if args.check and any(int(row["total"]) for row in rows):
+        return 1
+    return 0
+
+
+def cmd_anonymize_container(args: argparse.Namespace, src: Path) -> int:
+    """`anon.py verbale.docx` -> `verbale.redacted.docx`: same type, same layout, same map shape.
+
+    The alternative (convert to Markdown, redact, hand back Markdown) is what the guard does for a
+    `read`; here the operator gets the DOCUMENT back, with headers, footers, comments and properties
+    rewritten where they live instead of dropped.
+    """
+    if args.stdout:
+        print("anon: --stdout does not apply to a container: its content is not text", file=sys.stderr)
+        return 2
+    entities = resolve_entities(args)
+    destination = Path(args.map).expanduser().parent if args.map else DEFAULT_MAPS
+    tag = new_tag() if args.dry_run else allocate_tag([DEFAULT_MAPS, destination], getattr(args, "tag", None))
+    out: Path | None = None if args.dry_run else (Path(args.out).expanduser() if args.out else _default_output(src))
+    entries, counts, parts = anonymize_container(
+        src, out, entities,
+        include_heuristics=not args.no_hosts, families=resolve_families(args), tag=tag, dry_run=args.dry_run,
+    )
+    if args.dry_run:
+        if args.json:
+            print(json.dumps({
+                **_envelope("anon.py --dry-run"),
+                "dry_run": True, "container": True, "file": str(src), "sensitive": bool(entries),
+                "would_write": str(out), "would_map": str(plan_map_path(args)) if entries else None,
+                "entries": len(entries), "counts": counts, "parts": parts,
+            }, ensure_ascii=False))
+            return 0
+        if not args.quiet:
+            if entries:
+                summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                print(f"anon: dry run — nothing written; would redact {len(entries)} value(s) [{summary}]")
+                print(f"anon: would write -> {out}")
+                print(f"anon: would map   -> {plan_map_path(args)}")
+                for name, count in sorted(parts.items()):
+                    print(f"       {name}: {count}")
+            else:
+                print(f"anon: dry run — nothing sensitive in {src}; nothing would be written")
+        return 0
+
+    map_path = plan_map_path(args) if entries else None
+    if map_path is not None:
+        write_map(map_path, src, out, entries, counts)
+    if args.json:
+        print(json.dumps({
+            **_envelope("anon.py"), "container": True, "sensitive": bool(entries),
+            "redacted": str(out), "map": str(map_path) if map_path else None,
+            "entries": len(entries), "counts": counts, "parts": parts,
+        }, ensure_ascii=False))
+        return 0
+    if not args.quiet:
+        if not entries:
+            print(f"anon: nothing sensitive found in {src}", file=sys.stderr)
+        else:
+            summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            print(f"anon: {len(entries)} placeholder(s) [{summary}] over {len(parts)} part(s)")
+        print(f"anon: redacted -> {out}")
+        if map_path is not None:
+            print(f"anon: map      -> {map_path}")
+    return 0
+
+
+def cmd_anonymize(args: argparse.Namespace) -> int:
+    src = Path(args.file).expanduser()
+    if not src.is_file():
+        print(f"anon: not a file: {src}", file=sys.stderr)
+        return 2
+    kind = sniff(src)
+    if kind == "container":
+        return cmd_anonymize_container(args, src)
+    if kind is not None:
+        print(
+            f"anon: REFUSED — {src} is a binary file (PDF/image/legacy .doc/.xls/.ppt). Reading it\n"
+            "      as text would redact almost nothing and leave a corrupted copy named 'redacted'.\n"
+            "      Convert it to Markdown first, then anonymize that:\n"
+            '        doc_to_markdown(path="…", output="…/file.md")   # writes, does not return\n'
+            "        /anon …/file.md                                  # redacts the Markdown\n"
+            "      Nothing was written.",
+            file=sys.stderr,
+        )
+        return 2
+    entities = resolve_entities(args)
+    text = read_text(src)
+    # The tag must be unique among the maps that EXIST — and a map may be redirected with --map, so
+    # both the default directory and the destination are scanned: scanning only one would let a
+    # --map run draw a tag that an existing ~/.anon/maps map already uses, which is the silent
+    # substitution the tag exists to prevent.
+    destination = Path(args.map).expanduser().parent if args.map else DEFAULT_MAPS
+    # A dry run writes nothing, so it does not need a collision-free tag: the preview only shows
+    # the SHAPE (`[EMAIL-1-a3f9d1]`), and the real run draws its own.
+    tag = new_tag() if args.dry_run else allocate_tag([DEFAULT_MAPS, destination], getattr(args, "tag", None))
+    redacted, entries, counts = anonymize(
+        text,
+        entities,
+        include_heuristics=not args.no_hosts,
+        families=resolve_families(args),
+        tag=tag,
+    )
+
+    out, map_path = write_run(src, redacted, entries, counts, tag, args, dry_run=args.dry_run)
+
+    if args.dry_run:
+        return _emit_dry_run(src, out, map_path, entries, counts, args)
+
+    if args.json:
+        print(json.dumps({
+            **_envelope("anon.py"),
+            "sensitive": bool(entries),
+            "redacted": str(out) if out else "(stdout)",
+            "map": str(map_path) if map_path else None,
+            "entries": len(entries),
+            "counts": counts,
+        }, ensure_ascii=False))
+        return 0
+
+    if not entries:
+        if not args.quiet:
+            print(f"anon: nothing sensitive found in {src}", file=sys.stderr)
+            if out is not None:
+                print(str(out))
+        return 0
+
+    if not args.quiet:
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        print(f"anon: {len(entries)} placeholder(s) [{summary}]")
+        if out is not None:
+            print(f"anon: redacted -> {out}")
+        print(f"anon: map      -> {map_path}")
+    return 0
+
+
+def cmd_prune_maps(args: argparse.Namespace) -> int:
+    """List the maps older than N days — and delete them only with `--yes`.
+
+    `~/.anon/maps` otherwise grows forever: every anonymize writes a map holding the REAL values,
+    and nothing ever removes one. Dry-run by default, because a deletion the operator cannot
+    preview is not something this tool should do on its own.
+    """
+    days = args.prune_maps
+    if days < 1:
+        # `0` would mean "cutoff = now", i.e. delete everything including the map written a second
+        # ago. Deleting is not undoable here, so the smallest accepted window is one day.
+        print("anon: --prune-maps takes at least 1 day (nothing is deleted without --yes)", file=sys.stderr)
+        return 2
+    cutoff = time.time() - days * 86400
+    candidates: list[tuple[Path, os.stat_result]] = []
+    if DEFAULT_MAPS.is_dir():
+        for path in sorted(DEFAULT_MAPS.glob("*.map.json")):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime < cutoff:
+                candidates.append((path, stat))
+
+    removed = 0
+    freed = 0
+    if args.yes:
+        for path, stat in candidates:
+            try:
+                path.unlink()
+            except OSError as exc:
+                print(f"anon: could not remove {path.name}: {exc}", file=sys.stderr)
+                continue
+            removed += 1
+            freed += stat.st_size
+
+    report: dict[str, object] = {
+        **_envelope("anon.py --prune-maps"),
+        "maps_dir": str(DEFAULT_MAPS),
+        "days": days,
+        "candidates": len(candidates),
+        "deleted": removed,
+        "bytes_freed": freed,
+        "applied": bool(args.yes),
+    }
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+        return 0
+    for path, stat in candidates:
+        age = (time.time() - stat.st_mtime) / 86400
+        print(f"anon: {'removed' if args.yes else 'would remove'} {path.name} ({age:.0f} days old, {stat.st_size} bytes)")
+    if not candidates:
+        print(f"anon: no map older than {days} day(s) in {DEFAULT_MAPS}")
+    elif args.yes:
+        print(f"anon: {removed} map(s) removed, {freed} bytes freed")
+    else:
+        print(f"anon: {len(candidates)} map(s) older than {days} day(s) — rerun with --yes to delete them")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="anon.py",
+        description="Deterministic, local anonymizer: FILE -> redacted copy + reversible map.",
+    )
+    parser.add_argument("file", nargs="?", help="text file to anonymize ('-' with --check reads stdin)")
+    parser.add_argument("--out", help="write the redacted copy here (default: <name>.redacted.<ext>)")
+    parser.add_argument("--map", help="write the map here (default: ~/.anon/maps/<id>.map.json)")
+    parser.add_argument(
+        "--entities",
+        action="append",
+        metavar="PATH",
+        help="dictionary file (repeatable; default: ~/.anon/entities.txt + people.txt + clients.txt, "
+        "whichever exist)",
+    )
+    parser.add_argument("--catalogs", help="comma-separated catalog names from ~/.anon/catalogs/")
+    parser.add_argument("--patterns", help=f"pattern groups to apply: {', '.join(PATTERN_FAMILIES)}")
+    parser.add_argument("--list-catalogs", action="store_true", help="list the installed catalogs and exit")
+    parser.add_argument(
+        "--prune-maps",
+        type=int,
+        metavar="DAYS",
+        help="list the maps in ~/.anon/maps older than DAYS (1 or more) and exit (add --yes to delete them)",
+    )
+    parser.add_argument(
+        "--verify-dictionary",
+        action="store_true",
+        help="report the same surface declared twice in the custom dictionaries (same context, any"
+             " types or files) and exit 1 if there are any",
+    )
+    parser.add_argument(
+        "--yes", action="store_true", help="with --prune-maps: actually delete the listed maps"
+    )
+    parser.add_argument("--allow", help="path-glob allowlist used by --check (default: ~/.anon/allow.txt)")
+    parser.add_argument(
+        "--allow-glob",
+        action="append",
+        metavar="GLOB",
+        help="extra path glob treated as un-sensitive by --check (repeatable; same syntax as --allow)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what WOULD be redacted and where it would be written, writing nothing",
+    )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="treat FILE as a directory and anonymize every eligible file in it",
+    )
+    parser.add_argument("--check", action="store_true", help="report sensitive content, write nothing")
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="verify that a file is REALLY anonymized (residual content + near misses), write nothing",
+    )
+    parser.add_argument(
+        "--reveal",
+        action="store_true",
+        help="with --audit: show the near-miss words and entity names (they are the sensitive data)",
+    )
+    parser.add_argument("--json", action="store_true", help="machine-readable JSON on stdout")
+    parser.add_argument("--stdout", action="store_true", help="write the redacted text to stdout")
+    parser.add_argument("--no-hosts", action="store_true", help="skip hostname/phone/IP heuristics")
+    parser.add_argument(
+        "--tag",
+        help="pin the per-map placeholder tag, used verbatim (default: random, checked against the existing maps)",
+    )
+    parser.add_argument("--quiet", action="store_true", help="suppress informational messages")
+    parser.add_argument("--version", action="version", version=f"anon.py {VERSION}")
+    return parser
+
+
+def cmd_verify_dictionary(args: argparse.Namespace) -> int:
+    """`--verify-dictionary`: report the same voce declared twice, exit 1 if there are any.
+
+    A duplicate never leaks — the first entry to load claims the span and redacts it — but the
+    TYPE the span gets is file order, which is arbitrary from the operator's side. Both
+    declarations are printed so the operator can pick one; the write boundaries (the dictionary
+    save, the suggester's add) refuse what this reports.
+    """
+    paths = _dictionary_paths(args)
+    conflicts = dictionary_conflicts(paths)
+    if args.json:
+        print(json.dumps(_envelope("verify-dictionary") | {"conflicts": conflicts},
+                         ensure_ascii=False, sort_keys=True))
+        return 1 if conflicts else 0
+    if not conflicts:
+        names = ", ".join(Path(str(path)).name for path in paths) or "(no dictionary file)"
+        print(f"anon: {names}: no duplicate surfaces")
+        return 0
+    for conflict in conflicts:
+        print(f"anon: {conflict['surface']} is declared twice:")
+        for entry in conflict["entries"]:
+            print(f"  {Path(str(entry['path'])).name}:{entry['line']}  "
+                  f"{entry['type']}|{entry['value']}")
+    print(f"anon: {len(conflicts)} duplicated surface(s) — the first to load wins the match, "
+          "pick one", file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.verify_dictionary:
+        try:
+            return cmd_verify_dictionary(args)
+        except ValueError as exc:
+            print(f"anon: {exc}", file=sys.stderr)
+            return 2
+    if args.list_catalogs:
+        available = list_catalogs()
+        if not available:
+            print(f"anon: no catalogs installed under {CATALOGS_DIR}")
+            return 0
+        for item in available:
+            print(f"{item['name']}\t{item['entries']} entries\t{item['path']}")
+        return 0
+    if args.prune_maps is not None:
+        return cmd_prune_maps(args)
+    if not args.file:
+        print("anon: a file is required (or use --list-catalogs)", file=sys.stderr)
+        return 2
+    try:
+        if args.audit:
+            return cmd_audit(args)
+        if args.batch:
+            return cmd_batch(args)
+        return cmd_check(args) if args.check else cmd_anonymize(args)
+    except ValueError as exc:
+        print(f"anon: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

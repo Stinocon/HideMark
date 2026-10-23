@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""convert.py — document → Markdown, locally, for the anonymizer.
+
+`anon.py` refuses binary documents on purpose (reading a .docx as text would redact almost
+nothing and leave a corrupted copy named "redacted"). Converting to Markdown first is therefore
+part of the pipeline, and this is the tool's own converter: it does not depend on an agent framework.
+
+    convert.py FILE            # Markdown on stdout
+    convert.py --doctor        # is a converter available?
+
+Resolution order for the `anydoc` engine:
+  1. importable in the running interpreter (the container installs it from
+     `requirements-anydoc.txt`, hashes pinned: `pip install --require-hashes -r ...`);
+  2. otherwise a pinned venv — `$ANON_CONVERTER_PYTHON`, else
+     `$XDG_CACHE_HOME/hidemark/venvs/anydoc-venv` (or `~/.cache/hidemark/...`), created on demand
+     with `--install`.
+
+Local only: no network at conversion time (only `--install` uses pip).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+PIN = "firecrawl-anydoc==0.2.3"
+# The hashed pin lives next to this script (and in the repository). Installing through it makes
+# pip verify the wheel's digest instead of trusting whatever the index serves today.
+REQUIREMENTS = Path(__file__).resolve().parent / "requirements-anydoc.txt"
+DEFAULT_VENV = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser() / "hidemark" / "venvs" / "anydoc-venv"
+
+_CONVERT_CODE = r"""
+import sys
+import anydoc
+try:
+    sys.stdout.write(anydoc.to_markdown(sys.argv[1]))
+except anydoc.ConvertError as exc:
+    print(f"convert: {type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(1)
+except OSError as exc:
+    print(f"convert: {exc}", file=sys.stderr)
+    sys.exit(1)
+"""
+
+
+def venv_python() -> Path:
+    override = os.environ.get("ANON_CONVERTER_PYTHON")
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_VENV / "bin" / "python"
+
+
+def has_anydoc(python: str) -> bool:
+    try:
+        return subprocess.run([python, "-c", "import anydoc"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+def ensure_venv() -> bool:
+    python = venv_python()
+    if has_anydoc(str(python)):
+        return True
+    # An explicit interpreter is an execution boundary: if it is unavailable, fail closed
+    # instead of provisioning the default shared venv. Tests can also disable provisioning
+    # without changing the normal first-use behavior.
+    if (
+        os.environ.get("ANON_CONVERTER_PYTHON")
+        or os.environ.get("ANON_CONVERTER_NO_PROVISION") == "1"
+    ):
+        return False
+    print(f"convert: creating a pinned venv in {DEFAULT_VENV} (first use)…", file=sys.stderr)
+    import venv
+
+    venv.create(DEFAULT_VENV, with_pip=True)
+    subprocess.run([str(python), "-m", "pip", "install", "--quiet", "--upgrade", "pip"], check=False)
+    if REQUIREMENTS.is_file():
+        # --require-hashes: every artifact must match a published digest, so a swapped wheel at
+        # the index cannot silently enter the venv.
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "--quiet", "--require-hashes", "-r", str(REQUIREMENTS)],
+            check=True,
+        )
+    else:
+        print(
+            f"convert: {REQUIREMENTS.name} not found next to this script — falling back to a version "
+            f"pin ({PIN}) without a digest check",
+            file=sys.stderr,
+        )
+        subprocess.run([str(python), "-m", "pip", "install", "--quiet", PIN], check=True)
+    return has_anydoc(str(python))
+
+
+def convert(path: Path) -> int:
+    if not path.is_file():
+        print(f"convert: not a file: {path}", file=sys.stderr)
+        return 2
+    # 1) the running interpreter (the container case)
+    try:
+        import anydoc  # noqa: F401
+
+        result = subprocess.run([sys.executable, "-c", _CONVERT_CODE, str(path)], check=False)
+        return result.returncode
+    except ImportError:
+        pass
+    # 2) the pinned venv
+    python = str(venv_python())
+    if not has_anydoc(python) and not ensure_venv():
+        if (
+            os.environ.get("ANON_CONVERTER_PYTHON")
+            or os.environ.get("ANON_CONVERTER_NO_PROVISION") == "1"
+        ):
+            print(
+                "convert: configured converter is unavailable; automatic provisioning is disabled.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            "convert: no converter engine available. Install it with "
+            f"`pip install {PIN}` or run `convert.py --install`.",
+            file=sys.stderr,
+        )
+        return 2
+    return subprocess.run([python, "-c", _CONVERT_CODE, str(path)], check=False).returncode
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="convert.py", description="document → Markdown, locally")
+    parser.add_argument("file", nargs="?", help="document to convert")
+    parser.add_argument("--doctor", action="store_true", help="report which engine would be used")
+    parser.add_argument("--install", action="store_true", help="provision the pinned venv")
+    args = parser.parse_args(argv)
+
+    if args.doctor:
+        try:
+            import anydoc  # noqa: F401
+
+            print(f"convert: anydoc is importable in {sys.executable}")
+            return 0
+        except ImportError:
+            python = str(venv_python())
+            ok = has_anydoc(python)
+            print(f"convert: venv {venv_python()} usable={ok}")
+            return 0 if ok else 2
+    if args.install:
+        return 0 if ensure_venv() else 2
+    if not args.file:
+        parser.error("a file is required (or --doctor)")
+    return convert(Path(args.file).expanduser())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

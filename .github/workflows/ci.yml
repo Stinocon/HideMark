@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+
+      # The converter is optional for the engine and required for the docx/pdf tests.
+      # A failure to install must not silence the suite: those tests skip themselves when it is
+      # missing. Installed through the hashed pin, exactly like the image and the native venv (a
+      # version pin alone would let CI run a different wheel than the one the container ships).
+      #
+      # The outcome is recorded and echoed into the run summary: a skip that is visible only in the
+      # log reads as "everything ran" to anyone reading the checks list, which is how a green run
+      # ends up claiming coverage it did not have.
+      - name: Install the document converter
+        id: converter
+        run: |
+          if pip install --require-hashes -r requirements-anydoc.txt; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=converter unavailable::docx/pdf tests will SKIP in this run"
+          fi
+
+      - name: Engine suite
+        run: python3 tests/test_anon.py
+
+      - name: Composition suite
+        run: python3 tests/test_composition.py
+
+      - name: Dictionary classification
+        run: node tests/test_dictionary_classification.mjs
+
+      - name: Web UI integration
+        run: python3 tests/test_web.py
+
+      - name: Local-model seam (loopback only, fail-closed, writes nothing)
+        run: python3 tests/test_suggest.py
+
+      - name: Private-store backup and restore
+        run: python3 tests/test_backup.py
+
+      - name: MCP seam (check/anonymize, no real value in the answer)
+        run: python3 tests/test_mcp.py
+
+      - name: Pre-commit git guard (refuses clean/smudge filters)
+        run: python3 tests/test_git_guard.py
+
+      - name: UI loads without throwing
+        run: node tests/ui_load_check.mjs
+
+      - name: Docker smoke test
+        run: make smoke
+
+      - name: Numbers in the docs match the code
+        run: python3 scripts/check-doc-numbers.py
+
+      - name: Coverage floor — the suites run the shipped engine
+        run: python3 scripts/coverage.py
+
+      - name: Mutation corpus — every defect must make a test fail
+        run: python3 scripts/mutate.py
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ci"
+            echo
+            if [ "${{ steps.converter.outputs.installed }}" = "true" ]; then
+              echo "- document converter: **installed** — the docx/pdf path was exercised"
+            else
+              echo "- document converter: **NOT installed** — the docx/pdf tests were **skipped**,"
+              echo "  so this run did NOT exercise the conversion path (see the *Install* step's log)"
+            fi
+            echo "- gates run: engine, composition, dictionary classification, web integration, local-model seam, private-store backup, MCP seam, git guard, UI load, Docker smoke, documentation numbers, coverage floor, mutation corpus"
+          } >> "$GITHUB_STEP_SUMMARY"

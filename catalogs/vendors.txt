@@ -1,0 +1,175 @@
+# Hardware and software vendor starter catalog. Optional and incomplete; review each match.
+# This catalog adds 164 entries. `VendorsCatalogTest` checks the case-sensitive and case-insensitive blocks.
+# Adding 164 entries is not the goal; keep this list focused on names useful in IT documents.
+
+@type FORNITORE
+
+# --- block 1: case-sensitive (the name is also an ordinary word) ---
+@match case-sensitive
+Acer
+Adobe
+Amazon
+Apple
+Arista
+Avast
+Axis
+Barracuda
+Brother
+Canon
+Check Point
+Cisco
+Confluence
+Dell
+Elastic
+Gigabyte
+Google
+HP
+Intel
+Juniper
+Moxa
+New Relic
+Oki
+Okta
+Open Text
+Oracle
+Red Hat
+Ruckus
+Sage
+SAP
+Siemens
+Slack
+Snowflake
+Tenable
+Trend Micro
+Veritas
+Western Digital
+Xerox
+Zebra
+
+# --- block 2: case-insensitive (the lowercase is not a word) ---
+@match insensitive
+A10 Networks
+Acronis
+Advantech
+Akamai
+Alcatel
+Almaviva
+AMD
+APC
+Arcserve
+Aruba
+ASRock
+ASUS
+Atlassian
+Autodesk
+Avaya
+Avira
+Belden
+Bitdefender
+Broadcom
+Citrix
+Cloudera
+Cloudflare
+Commvault
+CrowdStrike
+D-Link
+Dahua
+Darktrace
+Databricks
+Datadog
+Datalogic
+Datto
+Dedagroup
+Dropbox
+Dynatrace
+Eaton
+Epson
+Ericsson
+ESET
+Extreme Networks
+F5 Networks
+Fastly
+Forcepoint
+Fortinet
+Fujitsu
+GPI
+Grafana
+Grandstream
+Hikvision
+HPE
+Huawei
+HubSpot
+IBM
+Imperva
+JetBrains
+Kaspersky
+Kingston
+Konica Minolta
+Kyocera
+Legrand
+Lenovo
+Lexmark
+Maggioli
+McAfee
+MediaTek
+Microsoft
+MikroTik
+Mimecast
+Mitel
+Nagios
+Nakivo
+NetApp
+Netgear
+Netskope
+Nokia
+Nutanix
+NVIDIA
+Paessler
+Palo Alto Networks
+Polycom
+Proofpoint
+Proxmox
+QNAP
+Qualcomm
+Qualys
+Rapid7
+Ricoh
+Riello
+Rittal
+Rubrik
+Salesforce
+Samsung
+SanDisk
+Schneider Electric
+Seagate
+SentinelOne
+ServiceNow
+SolarWinds
+SonicWall
+Sophos
+Splunk
+Supermicro
+SUSE
+Symantec
+Synology
+TeamSystem
+Teradata
+Toshiba
+TP-Link
+Trellix
+Tripp Lite
+Ubiquiti
+Veeam
+Vertiv
+VMware
+WatchGuard
+Xiaomi
+Yealink
+Zabbix
+Zendesk
+Zimbra
+Zoho
+Zscaler
+ZTE
+Zucchetti
+Zyxel

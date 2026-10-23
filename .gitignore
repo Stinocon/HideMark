@@ -1,0 +1,21 @@
+# Private data — never versioned.
+maps/
+*.map.json
+*.composition.json
+entities.txt
+allow.txt
+profiles/
+*.redacted.*
+*.deanon.*
+
+# Runtime scratch
+work/
+out/
+__pycache__/
+*.pyc
+
+# Local env
+.venv/
+venv/
+.env
+.DS_Store

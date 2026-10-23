@@ -1,0 +1,81 @@
+# HideMark — local UI. `docker compose up -d` and open http://127.0.0.1:1407
+#
+# Text-only variant: `docker compose --profile slim up -d hidemark-slim` on port 1408.
+#
+# SECURITY: the UI has NO authentication. It is therefore published on 127.0.0.1 only. Changing
+# the port mapping to "1407:1407" would expose your documents and your entity dictionary to the
+# whole network — don't, unless you really mean it.
+
+services:
+  hidemark:
+    build:
+      context: .
+      args:
+        WITH_CONVERTER: "1" # 0 = text formats only, smaller image
+    image: hidemark:local
+    container_name: hidemark
+    ports:
+      - "127.0.0.1:1407:1407"
+    volumes:
+      # The SAME entities.txt and the SAME maps the CLI uses: one source of truth.
+      - "${ANON_HOME:-$HOME/.anon}:/data"
+    environment:
+      ANON_HOME: /data
+      ANON_CONVERTER: /app/convert.py
+      # No local-model flags here on purpose: this file starts the UI alone. The suggestion model is
+      # attached by docker-compose.model.yml (`make model` / `make up MODEL=1`), which shares this
+      # container's network namespace so 127.0.0.1:8080 is loopback for both. A model on the HOST is
+      # refused — not loopback — so point the native server at it if that is what you want.
+      # Upload cap for the UI: 160 MB by default, raised here on purpose for a genuinely huge
+      # document. The conversion stays bounded by ANON_CONVERT_TIMEOUT / ANON_CONVERT_MAX_BYTES.
+      ANON_MAX_UPLOAD_BYTES: ${ANON_MAX_UPLOAD_BYTES:-167772160}
+    read_only: true
+    tmpfs:
+      - /tmp # the converter needs scratch space
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:1407/',timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+
+  # Text-only variant (md/txt/csv/json/yaml): same engine, no converter, smaller image. It is a
+  # PROFILE, so `docker compose up` starts the default service only; run this one with either
+  #   docker compose --profile slim up -d hidemark-slim      (or: make up-slim)
+  # It uses its own port so the two can coexist, and /api/state answers `converter: false`
+  # because the slim image genuinely has none.
+  hidemark-slim:
+    profiles: ["slim"]
+    build:
+      context: .
+      args:
+        WITH_CONVERTER: "0"
+    image: hidemark:slim
+    container_name: hidemark-slim
+    ports:
+      - "127.0.0.1:${ANON_SLIM_PORT:-1408}:1407"
+    volumes:
+      - "${ANON_HOME:-$HOME/.anon}:/data"
+    environment:
+      ANON_HOME: /data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:1407/',timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
