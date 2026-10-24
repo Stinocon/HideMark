@@ -58,7 +58,7 @@ build: ## build the image only
 native: ## run the server directly, without Docker
 	python3 web/server.py --port $(PORT)
 
-test: ## engine + web + local-model seam + backup + MCP + git guard + UI load + doc numbers (no Docker)
+test: ## engine + web + local-model seam + backup + MCP + git guard + UI load + smoke diagnostics + doc numbers (no Docker daemon)
 	@if [ -z "$(TEST_CONVERTER_FRAMEWORK_PATH)" ]; then echo "make test: could not resolve the converter Python framework; DOCX/PDF tests may fail" >&2; fi
 	DYLD_FRAMEWORK_PATH="$(TEST_CONVERTER_FRAMEWORK_PATH)" python3 tests/test_anon.py
 	python3 tests/test_composition.py
@@ -69,6 +69,7 @@ test: ## engine + web + local-model seam + backup + MCP + git guard + UI load + 
 	python3 tests/test_git_guard.py
 	node tests/ui_load_check.mjs
 	node tests/test_dictionary_classification.mjs
+	python3 tests/test_smoke_docker_diagnostics.py
 	python3 scripts/check-doc-numbers.py
 
 hooks: ## install git-hooks/ into .git/hooks/ (pre-commit refuses clean/smudge filters)

@@ -106,6 +106,7 @@ Do not commit mappings, manifests, real input files, or redacted output that may
 - `ANON_MAX_UPLOAD_BYTES` sets the web upload limit.
 - `ANON_CONVERTER_PYTHON` selects a converter interpreter. Without it, the pinned environment is created under `$XDG_CACHE_HOME/hidemark/venvs/` or `~/.cache/hidemark/venvs/`.
 - The optional suggester accepts only loopback endpoints. Configure its URL and model explicitly; it sends submitted text to that local endpoint.
+- The optional Compose model image is pinned by immutable OCI digest. Its model cache defaults to `$HOME/.hidemark/models`; set `ANON_MODEL_DIR` to use another directory.
 - `docker-compose.yml` binds the UI to `127.0.0.1:1407`. Do not expose the port directly to a network: the UI has no authentication.
 
 See [SECURITY.md](SECURITY.md) for the threat model and [docs/DESIGN.md](docs/DESIGN.md) for the data flow and limits.

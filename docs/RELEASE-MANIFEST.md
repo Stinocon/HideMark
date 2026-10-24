@@ -62,6 +62,7 @@ not included.
 | `tests/test_git_guard.py` | Tests repository Git-filter safeguards in temporary repositories. |
 | `tests/test_mcp.py` | Tests the MCP interface with synthetic protocol messages. |
 | `tests/test_suggest.py` | Tests suggestions using synthetic input and local test servers. |
+| `tests/test_smoke_docker_diagnostics.py` | Tests Docker smoke diagnostics and safe cleanup with a fake Docker CLI. |
 | `tests/test_web.py` | Tests web behavior with synthetic requests and temporary data. |
 | `tests/ui_load_check.mjs` | Checks that the browser UI loads its local assets. |
 | `web/app.css` | Provides local UI styling. |

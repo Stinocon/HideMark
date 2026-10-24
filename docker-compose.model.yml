@@ -30,11 +30,11 @@ services:
     # panel answers 502 until the model has loaded — a real error, not a silent wait.
 
   suggest-model:
-    image: ghcr.io/ggml-org/llama.cpp:server
+    image: ghcr.io/ggml-org/llama.cpp@sha256:20c4196fc08b459a34ef78aaa05b101333b2fac687e30ec99f37b3c9dc071b44
     container_name: hidemark-model
     network_mode: "service:hidemark"
     volumes:
-      - "${ANON_MODEL_DIR:-$HOME/.anon/models}:/models:ro"
+      - "${ANON_MODEL_DIR:-$HOME/.hidemark/models}:/models:ro"
     command:
       - "--model"
       - "/models/qwen2.5-3b-instruct-q4_k_m.gguf"

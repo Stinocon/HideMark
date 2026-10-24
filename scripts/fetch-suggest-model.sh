@@ -17,7 +17,7 @@ MODEL="${ANON_SUGGEST_MODEL_FILE:-qwen2.5-3b-instruct-q4_k_m.gguf}"
 URL="${ANON_SUGGEST_MODEL_URL:-https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/${MODEL}}"
 SHA256_EXPECTED="${ANON_SUGGEST_MODEL_SHA256:-626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d}"
 SIZE_EXPECTED="${ANON_SUGGEST_MODEL_SIZE:-2104932768}"
-DIR="${ANON_MODEL_DIR:-$HOME/.anon/models}"
+DIR="${ANON_MODEL_DIR:-$HOME/.hidemark/models}"
 DEST="$DIR/$MODEL"
 
 mkdir -p "$DIR"
