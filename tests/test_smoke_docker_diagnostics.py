@@ -54,6 +54,12 @@ if args[:1] == ["build"]:
 if args[:1] == ["run"]:
     run_id = args[args.index("--label") + 1].split("=", 1)[1]
     run_id_file.write_text(run_id)
+    data_root = pathlib.Path(args[args.index("-v") + 1].split(":", 1)[0])
+    for path in (data_root, data_root / "maps", data_root / "catalogs"):
+        if path.stat().st_mode & 0o007 != 0o007:
+            print("fake Docker: smoke data path is not accessible to uid 10001", file=sys.stderr)
+            sys.exit(126)
+    print("fake Docker: smoke data paths are accessible to uid 10001", file=sys.stderr)
     if os.environ.get("FAKE_RUN_FAILURE") == "1":
         print("ambiguous-container-id")
         sys.exit(125)
@@ -189,6 +195,7 @@ sys.exit(0)
         result, calls, curl_calls, tmp_dir = self.run_smoke(success=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ALL DOCKER SMOKE CHECKS PASSED", result.stdout)
+        self.assertIn("fake Docker: smoke data paths are accessible to uid 10001", result.stderr)
         for expected in ("/api/state", "/api/anonymize", "127.0.0.1 only"):
             self.assertIn(expected, result.stdout)
         self.assertIn(["rm", "-f", "synthetic-container-id"], calls)

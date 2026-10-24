@@ -13,6 +13,10 @@ RUN_ATTEMPTED=0
 DATA="$(mktemp -d "${TMPDIR:-/tmp}/anon-smoke-XXXXXX")"
 DOCX_DIR=""
 mkdir -p "$DATA/maps" "$DATA/catalogs"
+# The image runs as uid 10001. A bind-mounted mktemp directory is commonly mode 0700, so the
+# container cannot initialize or write its synthetic smoke data on Linux. This tree is disposable
+# and contains only synthetic fixtures; grant the container user access only for this run.
+chmod 0777 "$DATA" "$DATA/maps" "$DATA/catalogs"
 printf 'AZIENDA|Contoso\n' > "$DATA/entities.txt"
 
 # Python provides timeout semantics on macOS and Linux without an external `timeout` utility.
