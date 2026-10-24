@@ -191,8 +191,8 @@ with zipfile.ZipFile(path) as archive:
     inside="\n".join(archive.read(name).decode("utf-8","replace") for name in archive.namelist())
 assert "contoso.local" not in inside, "value survived inside the document"
 tag=result["tag"]
-  assert f"[EMAIL-1-{tag}]" in inside, "placeholder missing inside document"
-  assert f"[EMAIL-1-{tag}]" in result["redacted"], "document and response do not share the tag"
+assert f"[EMAIL-1-{tag}]" in inside, "placeholder missing inside document"
+assert f"[EMAIL-1-{tag}]" in result["redacted"], "document and response do not share the tag"
 ' || fail "downloaded document did not pass redaction verification"
   pass "docx rewritten in place and verified inside output"
 else
