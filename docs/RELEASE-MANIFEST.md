@@ -25,6 +25,8 @@ not included.
 | `composition.py` | Implements multi-document composition and private manifests. |
 | `convert.py` | Implements optional document conversion through the pinned converter. |
 | `deanon.py` | Restores reviewed outputs using local mapping files. |
+| `docxfill.py` | Builds a DOCX from Markdown while retaining the reference document's style and TOC field. |
+| `docxstruct.py` | Reports a DOCX structure without exposing body prose or absolute input paths. |
 | `docker-compose.model.yml` | Optional local-model service configuration, bound to loopback. |
 | `docker-compose.yml` | Application and slim container definitions with loopback port bindings. |
 | `docker-entrypoint.sh` | Validates container startup configuration and launches the service. |
@@ -59,6 +61,8 @@ not included.
 | `tests/test_backup.py` | Tests mapping-store backup and restore behavior in temporary directories. |
 | `tests/test_composition.py` | Tests composition using temporary synthetic documents and maps. |
 | `tests/test_dictionary_classification.mjs` | Tests public dictionary classifications. |
+| `tests/test_docxfill.py` | Tests DOCX generation, reference preservation, and TOC field handling with synthetic documents. |
+| `tests/test_docxstruct.py` | Tests DOCX structure reporting and comparison with synthetic documents. |
 | `tests/test_git_guard.py` | Tests repository Git-filter safeguards in temporary repositories. |
 | `tests/test_mcp.py` | Tests the MCP interface with synthetic protocol messages. |
 | `tests/test_suggest.py` | Tests suggestions using synthetic input and local test servers. |

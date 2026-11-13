@@ -71,6 +71,12 @@ test: ## engine + web + local-model seam + backup + MCP + git guard + UI load + 
 	node tests/test_dictionary_classification.mjs
 	python3 tests/test_smoke_docker_diagnostics.py
 	python3 scripts/check-doc-numbers.py
+	@if [ -x "$(HOME)/.pi/agent/venvs/docx-venv/bin/python" ]; then \
+		"$(HOME)/.pi/agent/venvs/docx-venv/bin/python" tests/test_docxfill.py && \
+		"$(HOME)/.pi/agent/venvs/docx-venv/bin/python" tests/test_docxstruct.py; \
+	else \
+		echo "make test: docx-venv not found, skipping tests/test_docxfill.py" >&2; \
+	fi
 
 hooks: ## install git-hooks/ into .git/hooks/ (pre-commit refuses clean/smudge filters)
 	bash scripts/install-git-hooks.sh

@@ -44,6 +44,14 @@ Redact a text file and write a tagged mapping under `$HOME/.anon/maps/`:
 python3 anon.py report.txt
 ```
 
+Build a new `.docx` from Markdown by cloning the structure (styles, headers, footers, TOC field,
+section setup) of an existing report — the local-model workflow for producing reports in the
+house format. Requires python-docx (e.g. `~/.pi/agent/venvs/docx-venv/bin/python`):
+
+```sh
+~/.pi/agent/venvs/docx-venv/bin/python docxfill.py old_report.docx content.md -o new_report.docx
+```
+
 Check a file without writing output, then inspect what would change:
 
 ```sh
@@ -123,6 +131,12 @@ make smoke
 `make test` runs the unit and integration checks. `make coverage` measures exercised engine code, `make mutate` checks that selected defects are caught by named tests, and `make smoke` builds and exercises the container. The smoke test requires Docker; some document conversion checks require Pandoc and the pinned converter runtime.
 
 The UI supports Italian and English. Repository documentation and code comments are maintained in English.
+
+## Companion tools
+
+- `convert.py` — documents (PDF/DOCX/…) → Markdown, hash-pinned local runtime.
+- `docxfill.py` — Markdown → DOCX cloning a reference `.docx` structure (python-docx; tests in `tests/test_docxfill.py`, run with the docx interpreter).
+- `docxstruct.py` — dump the STRUCTURE of a `.docx` (headings/styles/table dims/headers/footers, no body prose) as Markdown or JSON; read-only (tests in `tests/test_docxstruct.py`).
 
 ## License and contributions
 
